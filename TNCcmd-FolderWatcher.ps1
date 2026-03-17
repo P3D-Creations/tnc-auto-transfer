@@ -2,9 +2,10 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.0.0
-  Date:    2026-03-12
+  Version: 1.1.0
+  Date:    2026-03-16
   Author:  Xander Luciano
+  Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
 ================================================================================
 
 .SYNOPSIS
@@ -14,6 +15,10 @@
     This script monitors a specified folder for newly created files and automatically
     transfers them to a Heidenhain CNC controller over the network using the TNCcmd
     command-line tool (part of TNCremo software package).
+    
+    Two watching modes are available:
+    - Synchronous (WaitForChanged): Simple, reliable, blocks during file processing
+    - Asynchronous (Event Queue): Non-blocking, handles rapid file creation
 
 .PREREQUISITES
     1. TNCremo must be installed on this PC
@@ -42,8 +47,43 @@
 # CONFIGURATION - Edit these variables to match your setup
 # ============================================================================
 
+# ------------------------------
+# WATCHER MODE
+# ------------------------------
+# Choose how the script monitors for file changes:
+#
+# "Synchronous"  - Uses WaitForChanged() in a loop
+#                  + Simple and reliable
+#                  + No scope/variable issues
+#                  - Blocks during file transfer (can't detect new files while transferring)
+#                  Best for: Infrequent file drops, simple setups
+#
+# "Asynchronous" - Uses event-based monitoring with a queue
+#                  + Non-blocking (continues detecting files during transfers)
+#                  + Handles rapid file creation
+#                  - Slightly more complex
+#                  Best for: Frequent file drops, production environments
+
+$WatcherMode = "Asynchronous"  # Options: "Synchronous" or "Asynchronous"
+
+# ------------------------------
+# MACHINE CONNECTION
+# ------------------------------
+
 # Machine IP address - Change this to your CNC machine's IP
 $MachineIP = "192.168.1.100"
+
+# Destination folder on the CNC machine
+# - TNC:\ is the root of the machine's storage
+# - Common paths: TNC:\nc_prog\, TNC:\Programs\, TNC:\
+$DestinationFolder = "TNC:\"
+
+# Connection timeout in seconds
+$ConnectionTimeout = 30
+
+# ------------------------------
+# FOLDER SETTINGS
+# ------------------------------
 
 # Watch folder path
 # - Use ".\WatchFolder" for a subfolder next to this script
@@ -51,38 +91,43 @@ $MachineIP = "192.168.1.100"
 # - Or specify a full path like "C:\NCPrograms\ToMachine"
 $WatchFolder = ".\WatchFolder"
 
-# Destination folder on the CNC machine
-# - TNC:\ is the root of the machine's storage
-# - Common paths: TNC:\nc_prog\, TNC:\Programs\, TNC:\
-$DestinationFolder = "TNC:\"
-
 # File filter - which files to watch for
 # - "*.h" for Heidenhain NC programs only
 # - "*.H" for uppercase extension
 # - "*.*" for all files
-# - "*.h,*.i,*.t" for multiple extensions (handled in code)
 $FileFilter = "*.*"
 
-# TNCcmd.exe path (usually auto-detected)
-$TNCcmdPath = "C:\Program Files (x86)\HEIDENHAIN\TNCremo\TNCcmd.exe"
+# ------------------------------
+# TRANSFER OPTIONS
+# ------------------------------
 
-# Transfer options
 $UseBinaryMode = $true           # Use /b flag for binary transfer (recommended)
 $ConvertNCPrograms = $false      # Use /c flag to convert .H/.I files during transfer
 $DeleteAfterTransfer = $false    # Delete source file after successful transfer
 $MoveToProcessedFolder = $true   # Move files to "Processed" subfolder after transfer
 $MoveToFailedFolder = $true      # Move files to "Failed" subfolder after max retries
 
-# Retry settings (for locked files on controller)
+# ------------------------------
+# RETRY SETTINGS
+# ------------------------------
+
+# For locked files on controller (file open in editor, etc.)
 $MaxRetries = 150                # Maximum retry attempts
 $RetryDelaySeconds = 30          # Seconds between retries
 
-# Logging
+# ------------------------------
+# LOGGING
+# ------------------------------
+
 $EnableLogging = $true
 $LogFile = ".\TNCcmd-Watcher.log"
 
-# Connection timeout in seconds
-$ConnectionTimeout = 30
+# ------------------------------
+# TNCcmd PATH
+# ------------------------------
+
+# TNCcmd.exe path (usually auto-detected)
+$TNCcmdPath = "C:\Program Files (x86)\HEIDENHAIN\TNCremo\TNCcmd.exe"
 
 # ============================================================================
 # END OF CONFIGURATION
@@ -98,7 +143,11 @@ $LogFile = if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Joi
 # ============================================================================
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
+    param(
+        [string]$Message,
+        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO"
+    )
     
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$Level] $Message"
@@ -158,7 +207,6 @@ function Test-MachineConnection {
     }
     
     # Try a TNCcmd connection test
-    # We'll try to connect and immediately disconnect
     $cmdFile = [System.IO.Path]::GetTempFileName()
     try {
         @"
@@ -166,7 +214,7 @@ CONNECT -I $IP
 EXIT
 "@ | Set-Content $cmdFile -Encoding ASCII
         
-        $result = & $TNCcmdPath < $cmdFile 2>&1
+        $result = cmd.exe /c "`"$TNCcmdPath`" < `"$cmdFile`"" 2>&1
         $exitCode = $LASTEXITCODE
         
         if ($exitCode -eq 0 -or $result -notmatch "error|failed|timeout") {
@@ -214,7 +262,40 @@ function Test-RetryableError {
     return $false
 }
 
+function Wait-FileReady {
+    <#
+    .SYNOPSIS
+        Waits for a file to be fully written and released by other processes.
+    #>
+    param(
+        [string]$FilePath,
+        [int]$TimeoutSeconds = 30
+    )
+    
+    $waited = 0
+    while ($waited -lt $TimeoutSeconds) {
+        try {
+            # Try to open file with exclusive access
+            $stream = [System.IO.File]::Open($FilePath, 'Open', 'Read', 'None')
+            $stream.Close()
+            $stream.Dispose()
+            return $true
+        }
+        catch {
+            Start-Sleep -Seconds 1
+            $waited++
+        }
+    }
+    return $false
+}
+
 function Send-FileToMachine {
+    <#
+    .SYNOPSIS
+        Transfers a file to the CNC machine with retry logic.
+    .OUTPUTS
+        Hashtable with Success (bool) and Retryable (bool) properties.
+    #>
     param(
         [string]$SourceFile,
         [string]$DestinationPath,
@@ -311,7 +392,94 @@ function Send-FileToMachine {
     }
 }
 
-function Start-FolderWatcher {
+function Move-ProcessedFile {
+    <#
+    .SYNOPSIS
+        Handles post-transfer file movement (delete, move to processed, or move to failed).
+    #>
+    param(
+        [string]$FilePath,
+        [bool]$Success
+    )
+    
+    $fileName = [System.IO.Path]::GetFileName($FilePath)
+    $parentDir = [System.IO.Path]::GetDirectoryName($FilePath)
+    
+    if ($Success) {
+        if ($DeleteAfterTransfer) {
+            Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+            Write-Log "Deleted source file: $fileName"
+        }
+        elseif ($MoveToProcessedFolder) {
+            $processedPath = Join-Path $parentDir "Processed\$fileName"
+            
+            # Handle duplicate filenames
+            if (Test-Path $processedPath) {
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+                $extension = [System.IO.Path]::GetExtension($fileName)
+                $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+                $processedPath = Join-Path $parentDir "Processed\${baseName}_${timestamp}${extension}"
+            }
+            
+            Move-Item $FilePath $processedPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Moved to Processed: $fileName"
+        }
+    }
+    else {
+        if ($MoveToFailedFolder) {
+            $failedPath = Join-Path $parentDir "Failed\$fileName"
+            
+            # Handle duplicate filenames
+            if (Test-Path $failedPath) {
+                $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
+                $extension = [System.IO.Path]::GetExtension($fileName)
+                $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+                $failedPath = Join-Path $parentDir "Failed\${baseName}_${timestamp}${extension}"
+            }
+            
+            Move-Item $FilePath $failedPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Moved to Failed folder: $fileName" "ERROR"
+        }
+    }
+}
+
+function Process-SingleFile {
+    <#
+    .SYNOPSIS
+        Processes a single file: wait for ready, transfer, move to appropriate folder.
+    #>
+    param([string]$FilePath)
+    
+    $fileName = [System.IO.Path]::GetFileName($FilePath)
+    
+    # Verify file still exists
+    if (-not (Test-Path $FilePath)) {
+        Write-Log "File no longer exists, skipping: $fileName" "WARNING"
+        return
+    }
+    
+    # Wait for file to be fully written
+    Write-Log "Waiting for file to be ready: $fileName"
+    $ready = Wait-FileReady -FilePath $FilePath -TimeoutSeconds 30
+    
+    if (-not $ready) {
+        Write-Log "File still locked after 30s, skipping: $fileName" "WARNING"
+        return
+    }
+    
+    # Transfer the file
+    $result = Send-FileToMachine -SourceFile $FilePath -DestinationPath $DestinationFolder
+    
+    # Handle post-transfer file movement
+    Move-ProcessedFile -FilePath $FilePath -Success $result.Success
+}
+
+function Initialize-WatchFolder {
+    <#
+    .SYNOPSIS
+        Creates watch folder and subfolders if they don't exist.
+    #>
+    
     # Create watch folder if it doesn't exist
     if (-not (Test-Path $WatchFolder)) {
         Write-Log "Creating watch folder: $WatchFolder"
@@ -333,139 +501,173 @@ function Start-FolderWatcher {
             New-Item -Path $failedFolder -ItemType Directory -Force | Out-Null
         }
     }
+}
+
+function Process-ExistingFiles {
+    <#
+    .SYNOPSIS
+        Processes any files that already exist in the watch folder on startup.
+    #>
+    
+    $existingFiles = Get-ChildItem -Path $WatchFolder -Filter $FileFilter -File -ErrorAction SilentlyContinue
+    
+    if ($existingFiles.Count -gt 0) {
+        Write-Log "Found $($existingFiles.Count) existing file(s) in watch folder"
+        foreach ($file in $existingFiles) {
+            Write-Log "Processing existing file: $($file.Name)"
+            Process-SingleFile -FilePath $file.FullName
+        }
+        Write-Log "Finished processing existing files"
+        Write-Log ""
+    }
+}
+
+function Start-SynchronousWatcher {
+    <#
+    .SYNOPSIS
+        Monitors folder using synchronous WaitForChanged() method.
+        Simple and reliable, but blocks during file processing.
+    #>
+    
+    Write-Log "Starting SYNCHRONOUS watcher (WaitForChanged mode)"
+    Write-Log ""
+    
+    # Create the FileSystemWatcher
+    $watcher = New-Object System.IO.FileSystemWatcher
+    $watcher.Path = $WatchFolder
+    $watcher.Filter = $FileFilter
+    $watcher.IncludeSubdirectories = $false
+    $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+    
+    try {
+        while ($true) {
+            # Wait for a file creation event (1 second timeout for responsiveness)
+            $result = $watcher.WaitForChanged([System.IO.WatcherChangeTypes]::Created, 1000)
+            
+            if (-not $result.TimedOut) {
+                $filePath = Join-Path $WatchFolder $result.Name
+                Write-Log ""
+                Write-Log "New file detected: $($result.Name)"
+                
+                # Small delay to ensure file write is complete
+                Start-Sleep -Milliseconds 500
+                
+                # Process the file
+                Process-SingleFile -FilePath $filePath
+                
+                Write-Log ""
+                Write-Log "Waiting for files... (Press Ctrl+C to stop)"
+            }
+        }
+    }
+    finally {
+        $watcher.Dispose()
+        Write-Log "Synchronous watcher stopped."
+    }
+}
+
+function Start-AsynchronousWatcher {
+    <#
+    .SYNOPSIS
+        Monitors folder using event-based asynchronous method with a queue.
+        Non-blocking, handles rapid file creation without missing events.
+    #>
+    
+    Write-Log "Starting ASYNCHRONOUS watcher (Event Queue mode)"
+    Write-Log ""
+    
+    # Thread-safe queue for detected files
+    $global:FileQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+    
+    # Create the FileSystemWatcher
+    $watcher = New-Object System.IO.FileSystemWatcher
+    $watcher.Path = $WatchFolder
+    $watcher.Filter = $FileFilter
+    $watcher.IncludeSubdirectories = $false
+    $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
+    $watcher.EnableRaisingEvents = $true
+    
+    # Event handler - just queues the file path (fast, no scope issues)
+    $action = {
+        $filePath = $Event.SourceEventArgs.FullPath
+        $global:FileQueue.Enqueue($filePath)
+    }
+    
+    # Register event handler
+    $eventJob = Register-ObjectEvent -InputObject $watcher -EventName Created -Action $action -SourceIdentifier "FileCreated"
+    
+    try {
+        while ($true) {
+            # Process any files in the queue
+            $filePath = $null
+            while ($global:FileQueue.TryDequeue([ref]$filePath)) {
+                $fileName = [System.IO.Path]::GetFileName($filePath)
+                Write-Log ""
+                Write-Log "New file detected: $fileName"
+                
+                # Small delay to ensure file write is complete
+                Start-Sleep -Milliseconds 500
+                
+                # Process the file
+                Process-SingleFile -FilePath $filePath
+                
+                Write-Log ""
+                Write-Log "Waiting for files... (Press Ctrl+C to stop)"
+            }
+            
+            # Small sleep to prevent CPU spinning
+            # This keeps PowerShell responsive to events while not burning CPU
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    finally {
+        # Cleanup
+        Unregister-Event -SourceIdentifier "FileCreated" -ErrorAction SilentlyContinue
+        Remove-Job -Name "FileCreated" -Force -ErrorAction SilentlyContinue
+        $watcher.EnableRaisingEvents = $false
+        $watcher.Dispose()
+        Write-Log "Asynchronous watcher stopped."
+    }
+}
+
+function Start-FolderWatcher {
+    <#
+    .SYNOPSIS
+        Main entry point - initializes and starts the folder watcher.
+    #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher Started"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.1.0"
     Write-Log "=============================================="
+    Write-Log "Watcher Mode:    $WatcherMode"
     Write-Log "Machine IP:      $MachineIP"
     Write-Log "Watch Folder:    $WatchFolder"
     Write-Log "Destination:     $DestinationFolder"
     Write-Log "File Filter:     $FileFilter"
     Write-Log "Retry Settings:  $MaxRetries attempts, ${RetryDelaySeconds}s delay"
     Write-Log "=============================================="
+    
+    # Initialize folders
+    Initialize-WatchFolder
+    
+    # Process any existing files
+    Process-ExistingFiles
+    
     Write-Log "Waiting for files... (Press Ctrl+C to stop)"
     Write-Log ""
     
-    # Create FileSystemWatcher
-    $watcher = New-Object System.IO.FileSystemWatcher
-    $watcher.Path = $WatchFolder
-    $watcher.Filter = $FileFilter
-    $watcher.IncludeSubdirectories = $false
-    $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::LastWrite
-    $watcher.EnableRaisingEvents = $true
-    
-    # Event handler for new files
-    $action = {
-        $path = $Event.SourceEventArgs.FullPath
-        $name = $Event.SourceEventArgs.Name
-        $changeType = $Event.SourceEventArgs.ChangeType
-        
-        # Wait a moment for the file to be fully written
-        Start-Sleep -Milliseconds 500
-        
-        # Wait for file to be released (up to 30 seconds)
-        $timeout = 30
-        $waited = 0
-        while ($waited -lt $timeout) {
-            try {
-                $stream = [System.IO.File]::Open($path, 'Open', 'Read', 'None')
-                $stream.Close()
-                break
-            }
-            catch {
-                Start-Sleep -Seconds 1
-                $waited++
-            }
+    # Start the appropriate watcher based on configuration
+    switch ($WatcherMode) {
+        "Synchronous" {
+            Start-SynchronousWatcher
         }
-        
-        if ($waited -ge $timeout) {
-            & $WriteLog "File still locked after ${timeout}s, skipping: $name" "WARNING"
-            return
+        "Asynchronous" {
+            Start-AsynchronousWatcher
         }
-        
-        # Transfer the file (returns hashtable with Success and Retryable)
-        $result = & $SendFile $path $DestinationFolder
-        
-        if ($result.Success) {
-            if ($DeleteAfterTransfer) {
-                Remove-Item $path -Force
-                & $WriteLog "Deleted source file: $name"
-            }
-            elseif ($MoveToProcessedFolder) {
-                $processedPath = Join-Path (Split-Path $path) "Processed\$name"
-                Move-Item $path $processedPath -Force
-                & $WriteLog "Moved to Processed: $name"
-            }
+        default {
+            Write-Log "Invalid WatcherMode: $WatcherMode. Use 'Synchronous' or 'Asynchronous'." "ERROR"
+            exit 1
         }
-        else {
-            # Transfer failed - move to Failed folder if enabled
-            if ($MoveToFailedFolder) {
-                $failedPath = Join-Path (Split-Path $path) "Failed\$name"
-                Move-Item $path $failedPath -Force
-                & $WriteLog "Moved to Failed folder: $name" "ERROR"
-            }
-        }
-    }
-    
-    # Pass functions to the scriptblock scope
-    $WriteLog = ${function:Write-Log}
-    $SendFile = ${function:Send-FileToMachine}
-    
-    # Register the event
-    $job = Register-ObjectEvent -InputObject $watcher -EventName "Created" -Action $action `
-        -MessageData @{
-            WriteLog = $WriteLog
-            SendFile = $SendFile
-            DeleteAfterTransfer = $DeleteAfterTransfer
-            MoveToProcessedFolder = $MoveToProcessedFolder
-            MoveToFailedFolder = $MoveToFailedFolder
-            DestinationFolder = $DestinationFolder
-        }
-    
-    # Also check for existing files on startup
-    $existingFiles = Get-ChildItem -Path $WatchFolder -Filter $FileFilter -File -ErrorAction SilentlyContinue
-    if ($existingFiles.Count -gt 0) {
-        Write-Log "Found $($existingFiles.Count) existing file(s) in watch folder"
-        foreach ($file in $existingFiles) {
-            Write-Log "Processing existing file: $($file.Name)"
-            $result = Send-FileToMachine -SourceFile $file.FullName -DestinationPath $DestinationFolder
-            
-            if ($result.Success) {
-                if ($DeleteAfterTransfer) {
-                    Remove-Item $file.FullName -Force
-                    Write-Log "Deleted source file: $($file.Name)"
-                }
-                elseif ($MoveToProcessedFolder) {
-                    $processedPath = Join-Path $WatchFolder "Processed\$($file.Name)"
-                    Move-Item $file.FullName $processedPath -Force
-                    Write-Log "Moved to Processed: $($file.Name)"
-                }
-            }
-            else {
-                # Transfer failed - move to Failed folder if enabled
-                if ($MoveToFailedFolder) {
-                    $failedPath = Join-Path $WatchFolder "Failed\$($file.Name)"
-                    Move-Item $file.FullName $failedPath -Force
-                    Write-Log "Moved to Failed folder: $($file.Name)" "ERROR"
-                }
-            }
-        }
-    }
-    
-    # Keep script running
-    try {
-        while ($true) {
-            Wait-Event -Timeout 1
-            # Process any pending events
-        }
-    }
-    finally {
-        # Cleanup on exit
-        Write-Log "Stopping folder watcher..."
-        Unregister-Event -SourceIdentifier $job.Name -ErrorAction SilentlyContinue
-        $watcher.EnableRaisingEvents = $false
-        $watcher.Dispose()
-        Write-Log "Folder watcher stopped."
     }
 }
 
@@ -477,6 +679,7 @@ function Start-FolderWatcher {
 Clear-Host
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "  Heidenhain TNCcmd Automatic File Transfer - Folder Watcher   " -ForegroundColor Cyan
+Write-Host "  Mode: $WatcherMode" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host ""
 
