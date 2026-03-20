@@ -2,8 +2,8 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.1.0
-  Date:    2026-03-16
+  Version: 1.2.0
+  Date:    2026-03-19
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
 ================================================================================
@@ -88,14 +88,19 @@ $ConnectionTimeout = 30
 # Watch folder path
 # - Use ".\WatchFolder" for a subfolder next to this script
 # - Use $PSScriptRoot for the same folder as the script
-# - Or specify a full path like "C:\NCPrograms\ToMachine"
 $WatchFolder = ".\WatchFolder"
+# - Or specify a full path like "C:\NCPrograms\ToMachine" or a UNC path like "\\Server\Share\Folder"
 
 # File filter - which files to watch for
 # - "*.h" for Heidenhain NC programs only
 # - "*.H" for uppercase extension
 # - "*.*" for all files
 $FileFilter = "*.*"
+
+# Include subdirectories - watch for files in subfolders recursively
+# - $true:  Monitors all subfolders, preserving folder structure on CNC destination
+# - $false: Only monitors files placed directly in the watch folder
+$IncludeSubdirectories = $true
 
 # ------------------------------
 # TRANSFER OPTIONS
@@ -403,7 +408,11 @@ function Move-ProcessedFile {
     )
     
     $fileName = [System.IO.Path]::GetFileName($FilePath)
-    $parentDir = [System.IO.Path]::GetDirectoryName($FilePath)
+    
+    # Compute relative path from watch folder for subfolder structure preservation
+    $watchBase = $WatchFolder.TrimEnd('\', '/')
+    $relativePath = $FilePath.Substring($watchBase.Length + 1)
+    $relativeDir = [System.IO.Path]::GetDirectoryName($relativePath)
     
     if ($Success) {
         if ($DeleteAfterTransfer) {
@@ -411,34 +420,115 @@ function Move-ProcessedFile {
             Write-Log "Deleted source file: $fileName"
         }
         elseif ($MoveToProcessedFolder) {
-            $processedPath = Join-Path $parentDir "Processed\$fileName"
+            # Preserve subfolder structure inside Processed folder
+            $processedBase = Join-Path $WatchFolder "Processed"
+            if ($relativeDir) {
+                $processedBase = Join-Path $processedBase $relativeDir
+                if (-not (Test-Path $processedBase)) {
+                    New-Item -Path $processedBase -ItemType Directory -Force | Out-Null
+                }
+            }
+            $processedPath = Join-Path $processedBase $fileName
             
             # Handle duplicate filenames
             if (Test-Path $processedPath) {
                 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
                 $extension = [System.IO.Path]::GetExtension($fileName)
                 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-                $processedPath = Join-Path $parentDir "Processed\${baseName}_${timestamp}${extension}"
+                $processedPath = Join-Path $processedBase "${baseName}_${timestamp}${extension}"
             }
             
             Move-Item $FilePath $processedPath -Force -ErrorAction SilentlyContinue
-            Write-Log "Moved to Processed: $fileName"
+            Write-Log "Moved to Processed: $relativePath"
         }
     }
     else {
         if ($MoveToFailedFolder) {
-            $failedPath = Join-Path $parentDir "Failed\$fileName"
+            # Preserve subfolder structure inside Failed folder
+            $failedBase = Join-Path $WatchFolder "Failed"
+            if ($relativeDir) {
+                $failedBase = Join-Path $failedBase $relativeDir
+                if (-not (Test-Path $failedBase)) {
+                    New-Item -Path $failedBase -ItemType Directory -Force | Out-Null
+                }
+            }
+            $failedPath = Join-Path $failedBase $fileName
             
             # Handle duplicate filenames
             if (Test-Path $failedPath) {
                 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($fileName)
                 $extension = [System.IO.Path]::GetExtension($fileName)
                 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-                $failedPath = Join-Path $parentDir "Failed\${baseName}_${timestamp}${extension}"
+                $failedPath = Join-Path $failedBase "${baseName}_${timestamp}${extension}"
             }
             
             Move-Item $FilePath $failedPath -Force -ErrorAction SilentlyContinue
-            Write-Log "Moved to Failed folder: $fileName" "ERROR"
+            Write-Log "Moved to Failed folder: $relativePath" "ERROR"
+        }
+    }
+}
+
+function New-RemoteDirectory {
+    <#
+    .SYNOPSIS
+        Creates a directory tree on the CNC machine using TNCcmd MKDIR.
+        Creates each intermediate directory level so parent folders are
+        guaranteed to exist before children. Silently succeeds if a
+        directory already exists.
+    .PARAMETER RemotePath
+        Full remote path, e.g. "TNC:\nc_prog\Outpost\Hinge Stop"
+    .PARAMETER BasePath
+        The portion of the path that already exists on the controller,
+        e.g. "TNC:\nc_prog". Only directories below this are created.
+    #>
+    param(
+        [string]$RemotePath,
+        [string]$BasePath = $DestinationFolder
+    )
+    
+    # Normalise separators and trim trailing slashes
+    $base = $BasePath.TrimEnd('\', '/').Replace('/', '\')
+    $full = $RemotePath.TrimEnd('\', '/').Replace('/', '\')
+    
+    # Nothing to create if the path equals the base
+    if ($full -eq $base) { return }
+    
+    # Get the relative portion (e.g. "Outpost\Hinge Stop")
+    $relative = $full.Substring($base.Length + 1)
+    $parts = $relative -split '\\'
+    
+    # Create each directory level using direct command-line execution
+    # (same approach as Send-FileToMachine for maximum compatibility)
+    $current = $base
+    foreach ($part in $parts) {
+        $current = "$current\$part"
+        
+        $arguments = "MKDIR `"$current`" -I $MachineIP"
+        
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $TNCcmdPath
+            $psi.Arguments = $arguments
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            
+            $process = [System.Diagnostics.Process]::Start($psi)
+            $stdout = $process.StandardOutput.ReadToEnd()
+            $stderr = $process.StandardError.ReadToEnd()
+            $process.WaitForExit($ConnectionTimeout * 1000)
+            
+            if ($process.ExitCode -eq 0) {
+                Write-Log "Created remote directory: $current" "SUCCESS"
+            } else {
+                # MKDIR returns an error if directory already exists - that's OK
+                Write-Log "MKDIR '$current' returned exit $($process.ExitCode) (may already exist)" "WARNING"
+                if ($stderr) { Write-Log "  MKDIR stderr: $stderr" "WARNING" }
+            }
+        }
+        catch {
+            Write-Log "MKDIR exception for '$current': $_" "WARNING"
         }
     }
 }
@@ -447,6 +537,7 @@ function Process-SingleFile {
     <#
     .SYNOPSIS
         Processes a single file: wait for ready, transfer, move to appropriate folder.
+        Supports subfolder structure - preserves relative paths on CNC destination.
     #>
     param([string]$FilePath)
     
@@ -467,8 +558,22 @@ function Process-SingleFile {
         return
     }
     
+    # Compute destination path, preserving subfolder structure
+    $watchBase = $WatchFolder.TrimEnd('\', '/')
+    $relativePath = $FilePath.Substring($watchBase.Length + 1)
+    $relativeDir = [System.IO.Path]::GetDirectoryName($relativePath)
+    
+    if ($relativeDir) {
+        # File is in a subfolder - mirror the structure on the CNC
+        $destPath = $DestinationFolder.TrimEnd('\', '/') + '\' + $relativeDir.Replace('/', '\')
+        Write-Log "Creating remote directory: $destPath"
+        New-RemoteDirectory -RemotePath $destPath
+    } else {
+        $destPath = $DestinationFolder
+    }
+    
     # Transfer the file
-    $result = Send-FileToMachine -SourceFile $FilePath -DestinationPath $DestinationFolder
+    $result = Send-FileToMachine -SourceFile $FilePath -DestinationPath $destPath
     
     # Handle post-transfer file movement
     Move-ProcessedFile -FilePath $FilePath -Success $result.Success
@@ -509,12 +614,25 @@ function Process-ExistingFiles {
         Processes any files that already exist in the watch folder on startup.
     #>
     
-    $existingFiles = Get-ChildItem -Path $WatchFolder -Filter $FileFilter -File -ErrorAction SilentlyContinue
+    $gciParams = @{
+        Path        = $WatchFolder
+        Filter      = $FileFilter
+        File        = $true
+        ErrorAction = 'SilentlyContinue'
+    }
+    if ($IncludeSubdirectories) { $gciParams['Recurse'] = $true }
+    
+    # Exclude files already in Processed or Failed folders
+    $existingFiles = Get-ChildItem @gciParams | Where-Object {
+        $rel = $_.FullName.Substring($WatchFolder.TrimEnd('\', '/').Length + 1)
+        $rel -notmatch '^(Processed|Failed)(\\|/)'
+    }
     
     if ($existingFiles.Count -gt 0) {
         Write-Log "Found $($existingFiles.Count) existing file(s) in watch folder"
         foreach ($file in $existingFiles) {
-            Write-Log "Processing existing file: $($file.Name)"
+            $rel = $file.FullName.Substring($WatchFolder.TrimEnd('\', '/').Length + 1)
+            Write-Log "Processing existing file: $rel"
             Process-SingleFile -FilePath $file.FullName
         }
         Write-Log "Finished processing existing files"
@@ -536,7 +654,7 @@ function Start-SynchronousWatcher {
     $watcher = New-Object System.IO.FileSystemWatcher
     $watcher.Path = $WatchFolder
     $watcher.Filter = $FileFilter
-    $watcher.IncludeSubdirectories = $false
+    $watcher.IncludeSubdirectories = $IncludeSubdirectories
     $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
     
     try {
@@ -545,6 +663,9 @@ function Start-SynchronousWatcher {
             $result = $watcher.WaitForChanged([System.IO.WatcherChangeTypes]::Created, 1000)
             
             if (-not $result.TimedOut) {
+                # Skip files created in Processed or Failed subfolders
+                if ($result.Name -match '^(Processed|Failed)(\\|/)') { continue }
+                
                 $filePath = Join-Path $WatchFolder $result.Name
                 Write-Log ""
                 Write-Log "New file detected: $($result.Name)"
@@ -583,14 +704,18 @@ function Start-AsynchronousWatcher {
     $watcher = New-Object System.IO.FileSystemWatcher
     $watcher.Path = $WatchFolder
     $watcher.Filter = $FileFilter
-    $watcher.IncludeSubdirectories = $false
+    $watcher.IncludeSubdirectories = $IncludeSubdirectories
     $watcher.NotifyFilter = [System.IO.NotifyFilters]::FileName
     $watcher.EnableRaisingEvents = $true
     
     # Event handler - just queues the file path (fast, no scope issues)
+    # Skips files created in Processed or Failed subfolders
     $action = {
-        $filePath = $Event.SourceEventArgs.FullPath
-        $global:FileQueue.Enqueue($filePath)
+        $name = $Event.SourceEventArgs.Name
+        if ($name -notmatch '^(Processed|Failed)(\\|/)') {
+            $filePath = $Event.SourceEventArgs.FullPath
+            $global:FileQueue.Enqueue($filePath)
+        }
     }
     
     # Register event handler
@@ -637,13 +762,14 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.1.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.2.0"
     Write-Log "=============================================="
     Write-Log "Watcher Mode:    $WatcherMode"
     Write-Log "Machine IP:      $MachineIP"
     Write-Log "Watch Folder:    $WatchFolder"
     Write-Log "Destination:     $DestinationFolder"
     Write-Log "File Filter:     $FileFilter"
+    Write-Log "Subdirectories:  $IncludeSubdirectories"
     Write-Log "Retry Settings:  $MaxRetries attempts, ${RetryDelaySeconds}s delay"
     Write-Log "=============================================="
     
