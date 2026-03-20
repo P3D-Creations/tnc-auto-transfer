@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.2.0
+  Version: 1.3.0
   Date:    2026-03-19
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -88,7 +88,6 @@ $ConnectionTimeout = 30
 # Watch folder path
 # - Use ".\WatchFolder" for a subfolder next to this script
 # - Use $PSScriptRoot for the same folder as the script
-$WatchFolder = ".\WatchFolder"
 # - Or specify a full path like "C:\NCPrograms\ToMachine" or a UNC path like "\\Server\Share\Folder"
 
 # File filter - which files to watch for
@@ -108,7 +107,11 @@ $IncludeSubdirectories = $true
 
 $UseBinaryMode = $true           # Use /b flag for binary transfer (recommended)
 $ConvertNCPrograms = $false      # Use /c flag to convert .H/.I files during transfer
-$DeleteAfterTransfer = $false    # Delete source file after successful transfer
+$DeleteBeforeTransfer = $true    # DEL existing file on controller before PUT (ensures clean overwrite)
+                                 # NOTE: Overwriting files that are OPEN on the controller requires
+                                 #       TNCcmdPlus (purchased USB dongle + Option #18 HEIDENHAIN DNC).
+                                 #       With TNCcmd Essential, open files will retry until closed.
+$DeleteAfterTransfer = $true    # Delete source file after successful transfer
 $MoveToProcessedFolder = $true   # Move files to "Processed" subfolder after transfer
 $MoveToFailedFolder = $true      # Move files to "Failed" subfolder after max retries
 
@@ -150,7 +153,7 @@ $LogFile = if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Joi
 function Write-Log {
     param(
         [string]$Message,
-        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS")]
+        [ValidateSet("INFO", "WARNING", "ERROR", "SUCCESS", "DEBUG")]
         [string]$Level = "INFO"
     )
     
@@ -162,6 +165,7 @@ function Write-Log {
         "ERROR"   { Write-Host $logMessage -ForegroundColor Red }
         "WARNING" { Write-Host $logMessage -ForegroundColor Yellow }
         "SUCCESS" { Write-Host $logMessage -ForegroundColor Green }
+        "DEBUG"   { Write-Host $logMessage -ForegroundColor DarkGray }
         default   { Write-Host $logMessage }
     }
     
@@ -243,6 +247,7 @@ function Test-RetryableError {
     param([string]$ErrorOutput)
     
     # Patterns that indicate the file is temporarily locked/busy (should retry)
+    # Includes Heidenhain LSV2 error codes from TNCcmd
     $retryPatterns = @(
         "locked",
         "in use",
@@ -256,7 +261,13 @@ function Test-RetryableError {
         "protection",
         "timeout",
         "connection lost",
-        "connection reset"
+        "connection reset",
+        "e20001721",       # File cannot be opened (file open on controller)
+        "e20001724",       # File cannot be deleted (write-protected or open)
+        "e2000172d",       # File access not possible
+        "e2000173b",       # No write-access
+        "e2000173c",       # NC still active: Function cannot be executed
+        "e2000175a"        # Transmission still active
     )
     
     foreach ($pattern in $retryPatterns) {
@@ -294,6 +305,63 @@ function Wait-FileReady {
     return $false
 }
 
+function Remove-RemoteFile {
+    <#
+    .SYNOPSIS
+        Attempts to delete a file on the CNC controller via TNCcmd DEL command.
+        Used before PUT to ensure a clean overwrite. Failures are non-fatal.
+    .OUTPUTS
+        $true if DEL succeeded or file didn't exist, $false if file is locked/open.
+    #>
+    param(
+        [string]$RemoteFilePath
+    )
+    
+    $arguments = "DEL `"$RemoteFilePath`" -I $MachineIP"
+    
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $TNCcmdPath
+        $psi.Arguments = $arguments
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
+        $process.WaitForExit($ConnectionTimeout * 1000)
+        
+        $combinedOutput = "$stdout $stderr".ToLower()
+        
+        if ($process.ExitCode -eq 0 -and $stderr -eq "") {
+            Write-Log "DEL succeeded: $RemoteFilePath" "DEBUG"
+            return $true
+        }
+        
+        # File doesn't exist - that's fine, PUT will create it
+        if ($combinedOutput -match "e20001720|does not exist") {
+            Write-Log "File does not exist on controller (will be created): $RemoteFilePath" "DEBUG"
+            return $true
+        }
+        
+        # File is locked/open on controller - DEL can't help, PUT will also fail
+        if ($combinedOutput -match "e20001724|cannot be deleted|e20001721|cannot be opened") {
+            Write-Log "File is open/locked on controller, cannot delete before overwrite: $RemoteFilePath" "WARNING"
+            return $false
+        }
+        
+        # Other error - log but continue with PUT anyway
+        Write-Log "DEL returned unexpected result (proceeding with PUT): $combinedOutput" "WARNING"
+        return $true
+    }
+    catch {
+        Write-Log "DEL exception (proceeding with PUT): $_" "WARNING"
+        return $true
+    }
+}
+
 function Send-FileToMachine {
     <#
     .SYNOPSIS
@@ -320,6 +388,14 @@ function Send-FileToMachine {
     $putOptions = ""
     if ($UseBinaryMode) { $putOptions += " /b" }
     if ($ConvertNCPrograms) { $putOptions += " /c" }
+    
+    # Delete existing file before PUT to ensure clean overwrite
+    if ($DeleteBeforeTransfer -and $Attempt -eq 1) {
+        $delResult = Remove-RemoteFile -RemoteFilePath $destFile
+        if (-not $delResult) {
+            Write-Log "File is locked on controller - will attempt PUT anyway (retry logic will handle)" "WARNING"
+        }
+    }
     
     # Direct command-line execution
     $arguments = @(
@@ -762,7 +838,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.2.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.3.0"
     Write-Log "=============================================="
     Write-Log "Watcher Mode:    $WatcherMode"
     Write-Log "Machine IP:      $MachineIP"
