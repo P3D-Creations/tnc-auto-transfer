@@ -10,7 +10,7 @@ Scripts for automatically sending files to Heidenhain CNC controllers over the n
 
 | Version | Date | Changes |
 |---------|------|---------|
-| 1.2.0 | 2026-03-16 | Added support for subdirectories, UNC paths, and overwriting existing programs on the machine |
+| 1.2.0 | 2026-03-21 | Added support for subdirectories, UNC paths, and overwriting existing programs on the machine |
 | 1.1.0 | 2026-03-16 | Added dual watcher modes (Synchronous/Asynchronous), fixed event handling reliability, improved code structure |
 | 1.0.0 | 2026-03-12 | Initial release with folder watcher and batch file scripts |
 
