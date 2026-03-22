@@ -1,6 +1,5 @@
-# Ignore everything
+# Ignore supporting documents
 *
-
 # Keep only the core project files
 !.gitignore
 !README.md
