@@ -838,7 +838,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.3.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.2.0"
     Write-Log "=============================================="
     Write-Log "Watcher Mode:    $WatcherMode"
     Write-Log "Machine IP:      $MachineIP"
