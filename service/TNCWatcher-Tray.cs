@@ -5,13 +5,19 @@
 //   green  = service running
 //   orange = service paused / starting / stopping
 //   red    = service stopped or not installed
-// Tooltip shows the latest log activity. Balloon (toast) notifications pop
-// above the tray on:
+// Tooltip shows the latest log activity. Self-drawn toast windows pop up in
+// the bottom-right corner (above the tray) on:
 //   - service state changes and new [ERROR] lines
 //   - successful transfers ("Transfer complete")
 //   - machine unreachable ("Machine unreachable") - once per file, no repeats
 //   - file locked on a reachable machine ("Waiting to retry") - reminder
 //     every few minutes until it clears
+// These are custom windows (see ToastForm), NOT NotifyIcon balloon tips,
+// because balloons route through the Windows notification system - which is
+// turned off on this PC (Settings > System > Notifications), so they never
+// appeared. The custom windows show regardless of that setting.
+//
+// Preview the toasts any time with:  TNCWatcher-Tray.exe --toasttest
 //
 // LEFT-CLICK the icon (or right-click -> Settings...) to open the Settings
 // dialog: watch folder, machine IP, destination, filter, retry/timeout
@@ -53,8 +59,28 @@ static class NativeMethods
 static class Program
 {
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
+        // Hidden preview mode: shows one sample toast of each kind so the
+        // notification appearance/position can be verified without waiting for
+        // a real transfer. Run:  TNCWatcher-Tray.exe --toasttest
+        if (args.Length > 0 && args[0] == "--toasttest")
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new ToastTestContext());
+            return;
+        }
+
+        // Render sample toasts to a PNG (for verification) and exit.
+        if (args.Length >= 2 && args[0] == "--toastsnap")
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            ToastForm.SaveSamplePng(args[1]);
+            return;
+        }
+
         bool createdNew;
         using (Mutex mutex = new Mutex(true, "TNCWatcherTraySingleInstance", out createdNew))
         {
@@ -63,6 +89,42 @@ static class Program
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new TrayContext());
         }
+    }
+}
+
+// Minimal harness that shows sample toasts (real ToastForm) then exits.
+class ToastTestContext : ApplicationContext
+{
+    public ToastTestContext()
+    {
+        Color green  = Color.FromArgb(46, 204, 64);
+        Color orange = Color.FromArgb(255, 165, 0);
+        Color red    = Color.FromArgb(224, 62, 45);
+
+        var samples = new[]
+        {
+            new object[] { "Transfer complete", "Sent to CNC: Ls Delrin Op2.h", green },
+            new object[] { "Waiting to retry", "PartB.h is locked on the controller - still retrying (attempt 3/150). Set the machine to Manual to free it.", orange },
+            new object[] { "Machine unreachable", "PartC.h will be sent automatically once the machine is back online.", red },
+        };
+
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        int margin = 12, y = wa.Bottom - margin;
+        for (int i = 0; i < samples.Length; i++)
+        {
+            ToastForm t = new ToastForm((string)samples[i][0], (string)samples[i][1], (Color)samples[i][2], 25000);
+            y -= t.Height;
+            t.Left = wa.Right - t.Width - margin;
+            t.Top = y;
+            y -= 8;
+            t.Show();
+        }
+
+        // Exit the process a little after the toasts self-dismiss.
+        System.Windows.Forms.Timer quit = new System.Windows.Forms.Timer();
+        quit.Interval = 28000;
+        quit.Tick += delegate { quit.Stop(); Application.Exit(); };
+        quit.Start();
     }
 }
 
@@ -407,6 +469,148 @@ class SettingsForm : Form
 }
 
 // ---------------------------------------------------------------------------
+// Self-drawn toast window (bottom-right, above the tray)
+//
+// Independent of the Windows notification system, so it appears even when
+// Settings > System > Notifications is turned off or Focus Assist is on -
+// which is why NotifyIcon balloon tips were invisible on this PC. Does not
+// steal keyboard focus (WS_EX_NOACTIVATE) so it won't interrupt an operator.
+// ---------------------------------------------------------------------------
+class ToastForm : Form
+{
+    readonly string titleText;
+    readonly string bodyText;
+    readonly Color accent;
+    System.Windows.Forms.Timer lifeTimer;
+    System.Windows.Forms.Timer fadeTimer;
+
+    // Show without taking focus, and keep it out of Alt-Tab.
+    protected override bool ShowWithoutActivation { get { return true; } }
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            CreateParams cp = base.CreateParams;
+            cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+            cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
+            return cp;
+        }
+    }
+
+    public ToastForm(string title, string message, Color accentColor, int displayMs)
+    {
+        titleText = title == null ? "" : title;
+        bodyText  = message == null ? "" : message;
+        accent    = accentColor;
+
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar   = false;
+        TopMost         = true;
+        StartPosition   = FormStartPosition.Manual;
+        BackColor       = Color.FromArgb(32, 32, 32);
+        Width           = 360;
+        Height          = 96;
+        Opacity         = 0.96;
+        DoubleBuffered  = true;
+
+        Paint += OnPaintToast;
+        // Click anywhere on the toast to dismiss it immediately.
+        Click += delegate { CloseSafe(); };
+
+        lifeTimer = new System.Windows.Forms.Timer();
+        lifeTimer.Interval = Math.Max(1000, displayMs);
+        lifeTimer.Tick += delegate { lifeTimer.Stop(); fadeTimer.Start(); };
+
+        fadeTimer = new System.Windows.Forms.Timer();
+        fadeTimer.Interval = 45;
+        fadeTimer.Tick += delegate
+        {
+            if (Opacity <= 0.12) { fadeTimer.Stop(); CloseSafe(); }
+            else { Opacity -= 0.12; }
+        };
+    }
+
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        lifeTimer.Start();
+    }
+
+    void CloseSafe()
+    {
+        try { Close(); } catch { }
+    }
+
+    void OnPaintToast(object sender, PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+        using (Brush ab = new SolidBrush(accent))
+            g.FillRectangle(ab, 0, 0, 5, Height);
+        using (Pen bp = new Pen(Color.FromArgb(70, 70, 70)))
+            g.DrawRectangle(bp, 0, 0, Width - 1, Height - 1);
+
+        using (Brush tb = new SolidBrush(Color.White))
+        using (Font tf = new Font("Segoe UI", 10.5F, FontStyle.Bold))
+            g.DrawString(titleText, tf, tb, new RectangleF(16, 10, Width - 26, 24));
+
+        using (Brush bb = new SolidBrush(Color.FromArgb(212, 212, 212)))
+        using (Font bf = new Font("Segoe UI", 9F))
+        using (StringFormat sf = new StringFormat())
+        {
+            sf.Trimming = StringTrimming.EllipsisWord;
+            g.DrawString(bodyText, bf, bb, new RectangleF(16, 36, Width - 26, Height - 44), sf);
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            if (lifeTimer != null) { lifeTimer.Dispose(); lifeTimer = null; }
+            if (fadeTimer != null) { fadeTimer.Dispose(); fadeTimer = null; }
+        }
+        base.Dispose(disposing);
+    }
+
+    // Render the three sample toasts stacked into one PNG (verification aid).
+    public static void SaveSamplePng(string path)
+    {
+        var samples = new[]
+        {
+            new object[] { "Transfer complete", "Sent to CNC: Ls Delrin Op2.h", Color.FromArgb(46, 204, 64) },
+            new object[] { "Waiting to retry", "PartB.h is locked on the controller - still retrying (attempt 3/150). Set the machine to Manual to free it.", Color.FromArgb(255, 165, 0) },
+            new object[] { "Machine unreachable", "PartC.h will be sent automatically once the machine is back online.", Color.FromArgb(224, 62, 45) },
+        };
+
+        int w = 360, h = 96, gap = 10;
+        using (Bitmap canvas = new Bitmap(w, h * samples.Length + gap * (samples.Length + 1)))
+        {
+            using (Graphics cg = Graphics.FromImage(canvas))
+                cg.Clear(Color.FromArgb(60, 60, 60)); // desktop-ish backdrop
+
+            int y = gap;
+            foreach (object[] s in samples)
+            {
+                using (ToastForm t = new ToastForm((string)s[0], (string)s[1], (Color)s[2], 1000))
+                {
+                    t.CreateControl();
+                    using (Bitmap one = new Bitmap(w, h))
+                    {
+                        t.DrawToBitmap(one, new Rectangle(0, 0, w, h));
+                        using (Graphics cg = Graphics.FromImage(canvas))
+                            cg.DrawImage(one, gap, y);
+                    }
+                }
+                y += h + gap;
+            }
+            canvas.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tray context
 // ---------------------------------------------------------------------------
 class TrayContext : ApplicationContext
@@ -436,6 +640,17 @@ class TrayContext : ApplicationContext
     string lastSentTime = "";
     Icon currentIcon;
     SettingsForm settingsForm;
+
+    // Self-drawn toast windows (bottom-right, above the tray). Used instead of
+    // NotifyIcon balloon tips because those route through the Windows
+    // notification system, which is disabled on this PC (Settings > System >
+    // Notifications is off) - so balloons never appeared. These custom windows
+    // show regardless of that setting or Focus Assist.
+    readonly List<ToastForm> toasts = new List<ToastForm>();
+    const int MaxVisibleToasts = 5;
+    static readonly Color ToastGreen  = Color.FromArgb(46, 204, 64);
+    static readonly Color ToastOrange = Color.FromArgb(255, 165, 0);
+    static readonly Color ToastRed    = Color.FromArgb(224, 62, 45);
 
     // A "still retrying" toast for a LOCKED file (machine reachable) fires at
     // most once per this many seconds, so a long lock (e.g. NC program left in
@@ -503,6 +718,45 @@ class TrayContext : ApplicationContext
         settingsForm.Show();
     }
 
+    // ------------------------------------------------------------------ toasts
+
+    void ShowToast(string title, string message, Color accent, int displayMs)
+    {
+        // Cap concurrent toasts so a burst can't cover the screen.
+        while (toasts.Count >= MaxVisibleToasts)
+        {
+            ToastForm oldest = toasts[0];
+            toasts.RemoveAt(0);
+            try { oldest.Close(); } catch { }
+        }
+
+        ToastForm t = new ToastForm(title, message, accent, displayMs);
+        t.FormClosed += delegate
+        {
+            toasts.Remove(t);
+            ReflowToasts();
+        };
+        toasts.Add(t);
+        ReflowToasts();
+        t.Show();
+    }
+
+    // Stack toasts up from the bottom-right corner, newest nearest the tray.
+    void ReflowToasts()
+    {
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+        int margin = 12;
+        int y = wa.Bottom - margin;
+        for (int i = toasts.Count - 1; i >= 0; i--)
+        {
+            ToastForm t = toasts[i];
+            y -= t.Height;
+            t.Left = wa.Right - t.Width - margin;
+            t.Top = y;
+            y -= 8; // gap between stacked toasts
+        }
+    }
+
     // ------------------------------------------------------------------ poll
 
     void Poll()
@@ -516,10 +770,9 @@ class TrayContext : ApplicationContext
             SetIconForStatus(status);
             if (!firstPoll)
             {
-                trayIcon.BalloonTipTitle = "TNCWatcher";
-                trayIcon.BalloonTipText = "Service is now: " + status;
-                trayIcon.BalloonTipIcon = (status == "Running") ? ToolTipIcon.Info : ToolTipIcon.Warning;
-                trayIcon.ShowBalloonTip(4000);
+                Color c = (status == "Running") ? ToastGreen
+                        : ((status == "Stopped" || status == "Not installed") ? ToastRed : ToastOrange);
+                ShowToast("TNCWatcher", "Service is now: " + status, c, 5000);
             }
         }
 
@@ -628,10 +881,7 @@ class TrayContext : ApplicationContext
                         (DateTime.Now - lastErrorBalloon).TotalSeconds > 30)
                     {
                         lastErrorBalloon = DateTime.Now;
-                        trayIcon.BalloonTipTitle = "TNCWatcher error";
-                        trayIcon.BalloonTipText = Truncate(StripTimestamp(trimmed), 200);
-                        trayIcon.BalloonTipIcon = ToolTipIcon.Error;
-                        trayIcon.ShowBalloonTip(6000);
+                        ShowToast("TNCWatcher error", Truncate(StripTimestamp(trimmed), 200), ToastRed, 8000);
                     }
                     else if (trimmed.Contains("[SUCCESS]") && trimmed.ToLower().Contains("successful"))
                     {
@@ -643,12 +893,10 @@ class TrayContext : ApplicationContext
                             lastSentFile = name;
                             lastSentTime = ExtractTimestamp(trimmed);
                         }
-                        trayIcon.BalloonTipTitle = "Transfer complete";
-                        trayIcon.BalloonTipText = (name.Length > 0)
+                        string body = (name.Length > 0)
                             ? ("Sent to CNC: " + Truncate(name, 180))
                             : Truncate(StripTimestamp(trimmed), 200);
-                        trayIcon.BalloonTipIcon = ToolTipIcon.Info;
-                        trayIcon.ShowBalloonTip(5000);
+                        ShowToast("Transfer complete", body, ToastGreen, 5000);
                     }
                     else if (trimmed.ToLower().Contains("before retry"))
                     {
@@ -665,11 +913,9 @@ class TrayContext : ApplicationContext
                             if (who != lastOfflineToastFile)
                             {
                                 lastOfflineToastFile = who;
-                                trayIcon.BalloonTipTitle = "Machine unreachable";
-                                trayIcon.BalloonTipText = Truncate(who, 150)
-                                    + " will be sent automatically once the machine is back online.";
-                                trayIcon.BalloonTipIcon = ToolTipIcon.Warning;
-                                trayIcon.ShowBalloonTip(6000);
+                                ShowToast("Machine unreachable",
+                                    Truncate(who, 150) + " will be sent automatically once the machine is back online.",
+                                    ToastOrange, 8000);
                             }
                         }
                         else if ((DateTime.Now - lastRetryBalloon).TotalSeconds > RetryBalloonCooldownSeconds)
@@ -678,12 +924,10 @@ class TrayContext : ApplicationContext
                             // (e.g. NC program still in Running mode): periodic
                             // reminder so it can be freed.
                             lastRetryBalloon = DateTime.Now;
-                            trayIcon.BalloonTipTitle = "Waiting to retry";
-                            trayIcon.BalloonTipText = Truncate(who, 150)
-                                + " is locked on the controller — still retrying" + attempt
-                                + ". Set the machine to Manual / close the program to free it.";
-                            trayIcon.BalloonTipIcon = ToolTipIcon.Warning;
-                            trayIcon.ShowBalloonTip(6000);
+                            ShowToast("Waiting to retry",
+                                Truncate(who, 150) + " is locked on the controller — still retrying" + attempt
+                                + ". Set the machine to Manual / close the program to free it.",
+                                ToastOrange, 8000);
                         }
                     }
                 }
@@ -905,6 +1149,10 @@ class TrayContext : ApplicationContext
     void ExitApp()
     {
         pollTimer.Stop();
+        foreach (ToastForm t in toasts.ToArray())
+        {
+            try { t.Close(); } catch { }
+        }
         trayIcon.Visible = false;
         trayIcon.Dispose();
         if (currentIcon != null) currentIcon.Dispose();
