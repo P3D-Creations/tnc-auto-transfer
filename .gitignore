@@ -5,3 +5,20 @@
 !README.md
 !TNCcmd-FolderWatcher.ps1
 !TNCcmd-SendFile.bat
+
+# Service setup and live log viewer (nssm.exe binary and logs stay ignored)
+!TNCWatcher-Console.ps1
+!TNCWatcher-Console.cmd
+!service/
+service/*
+!service/Install-TNCWatcher-Service.ps1
+!service/Install-TNCWatcher-Service.cmd
+!service/Uninstall-TNCWatcher-Service.cmd
+!service/Set-TNCWatcherAccount.ps1
+!service/Set-TNCWatcherAccount.cmd
+!service/Set-NASCredential.ps1
+!service/Set-NASCredential.cmd
+!service/TNCWatcher-Tray.cs
+!service/Build-TrayApp.cmd
+!service/Apply-TrayConfig.ps1
+!service/TNCWatcher-3h-Restart.xml
