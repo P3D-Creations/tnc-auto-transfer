@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.6.0
+  Version: 1.6.1
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -133,10 +133,18 @@ $MoveToFailedFolder = $true      # Move files to "Failed" subfolder after max re
 # TOOL TABLE ROUTING
 # ------------------------------
 
-# Files listed here (case-insensitive) are routed to $ToolTableDestination instead
-# of $DestinationFolder, and receive special handling (backup + merge/overwrite).
-$ToolTableFiles       = @("tool.t")    # Filenames that trigger tool-table handling
-$ToolTableDestination = "TNC:\\table\\" # Destination folder on CNC for tool tables
+# Files with these names (case-insensitive), OR any file placed in the tool
+# table folder below, are routed to $ToolTableDestination instead of
+# $DestinationFolder and receive special handling (backup + merge/overwrite).
+$ToolTableFiles       = @("tool.t")    # Filenames that always trigger tool-table handling
+$ToolTableDestination = "TNC:\table\"  # Destination folder on the CNC for tool tables
+
+# Dedicated subfolder INSIDE the watch folder for tool tables. Any file dropped
+# here is treated as a tool table and routed to $ToolTableDestination (never to
+# the NC-program location). Timestamped backups of the remote table are kept in
+# its "Backups" subfolder. The whole folder is excluded from normal watching so
+# a downloaded backup is never sent back to the machine.
+$ToolTableFolder = "ToolTables"        # Relative to the watch folder, or an absolute path
 
 # Controls how an incoming tool table is applied to the controller.
 #
@@ -154,8 +162,9 @@ $ToolTableDestination = "TNC:\\table\\" # Destination folder on CNC for tool tab
 $ToolTableTransferMode = "Merge"   # "Merge" | "Overwrite"
 
 # Before any merge or overwrite, the current remote tool table is downloaded and
-# saved locally as a timestamped backup. Older backups are pruned automatically.
-$ToolTableBackupFolder = ".\ToolTableBackups"   # Relative to script or absolute path
+# saved locally as a timestamped backup. Backups are stored in the "Backups"
+# subfolder of $ToolTableFolder (set automatically below). Older backups are
+# pruned automatically.
 $ToolTableBackupCount  = 20                      # Max number of backups to keep
 
 # ------------------------------
@@ -207,6 +216,8 @@ if (Test-Path $ConfigFile) {
         if ($cfg.RetryDelaySeconds)      { $RetryDelaySeconds      = [int]$cfg.RetryDelaySeconds }
         if ($cfg.ConnectionTimeout)      { $ConnectionTimeout      = [int]$cfg.ConnectionTimeout }
         if ($cfg.TransferTimeoutSeconds) { $TransferTimeoutSeconds = [int]$cfg.TransferTimeoutSeconds }
+        if ($cfg.ToolTableTransferMode)  { $ToolTableTransferMode  = [string]$cfg.ToolTableTransferMode }
+        if ($cfg.ToolTableFolder)        { $ToolTableFolder        = [string]$cfg.ToolTableFolder }
         $ConfigOverridesActive = $true
     }
     catch {
@@ -216,6 +227,24 @@ if (Test-Path $ConfigFile) {
 $WatchFolder = if ([System.IO.Path]::IsPathRooted($WatchFolder)) { $WatchFolder } else { Join-Path $ScriptDir $WatchFolder }
 $LogFile = if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Join-Path $ScriptDir $LogFile }
 $NASCredentialFile = if ([System.IO.Path]::IsPathRooted($NASCredentialFile)) { $NASCredentialFile } else { Join-Path $ScriptDir $NASCredentialFile }
+
+# Tool table folder lives inside the watch folder unless an absolute path was
+# given; backups go in its "Backups" subfolder.
+$ToolTableFolder = if ([System.IO.Path]::IsPathRooted($ToolTableFolder)) { $ToolTableFolder } else { Join-Path $WatchFolder $ToolTableFolder }
+$ToolTableBackupFolder = Join-Path $ToolTableFolder "Backups"
+
+# Build the exclusion regex used by every watcher entry point. Files whose path
+# (relative to the watch folder) matches this are NOT processed as NC programs:
+# the Processed/Failed folders always, plus the tool-table Backups folder when
+# it lives inside the watch folder (so downloaded backups are never re-sent).
+$WatchBaseForExclude = $WatchFolder.TrimEnd('\', '/')
+$excludeNames = @('Processed', 'Failed')
+$backupTrim = $ToolTableBackupFolder.TrimEnd('\', '/')
+if ($backupTrim.ToLower().StartsWith(($WatchBaseForExclude + '\').ToLower())) {
+    $backupRel = $backupTrim.Substring($WatchBaseForExclude.Length + 1)
+    $excludeNames += [regex]::Escape($backupRel)
+}
+$global:WatchExcludeRegex = '^(' + ($excludeNames -join '|') + ')(\\|/)'
 
 # ============================================================================
 # FUNCTIONS
@@ -1140,9 +1169,17 @@ function Process-SingleFile {
         return
     }
     
-    # Check if this is a tool table file that needs special routing
-    $isToolTable = $ToolTableFiles | Where-Object { $_ -ieq $fileName }
-    if ($isToolTable) {
+    # Check if this is a tool table needing special routing: either the filename
+    # matches $ToolTableFiles, or it was dropped in the tool table folder (but
+    # not in that folder's Backups subfolder).
+    $ttFolder    = $ToolTableFolder.TrimEnd('\', '/')
+    $ttBackup    = $ToolTableBackupFolder.TrimEnd('\', '/')
+    $lowerPath   = $FilePath.ToLower()
+    $inToolTableFolder = $lowerPath.StartsWith(($ttFolder + '\').ToLower()) -and
+                         -not $lowerPath.StartsWith(($ttBackup + '\').ToLower())
+    $isToolTableByName = @($ToolTableFiles | Where-Object { $_ -ieq $fileName }).Count -gt 0
+
+    if ($inToolTableFolder -or $isToolTableByName) {
         Write-Log "Tool table file detected: $fileName -> $ToolTableDestination (mode: $ToolTableTransferMode)"
         $result = Send-ToolTableFile -SourceFile $FilePath -DestinationPath $ToolTableDestination
         Move-ProcessedFile -FilePath $FilePath -Success $result.Success
@@ -1221,6 +1258,21 @@ function Initialize-WatchFolder {
             New-Item -Path $failedFolder -ItemType Directory -Force | Out-Null
         }
     }
+
+    # Create the tool table folder and its Backups subfolder. Files dropped in
+    # the tool table folder are sent as tool tables; the Backups subfolder holds
+    # timestamped downloads of the remote table and is excluded from watching.
+    foreach ($folder in @($ToolTableFolder, $ToolTableBackupFolder)) {
+        if (-not (Test-Path $folder)) {
+            try {
+                New-Item -Path $folder -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                Write-Log "Created tool table folder: $folder" "DEBUG"
+            }
+            catch {
+                Write-Log "Could not create tool table folder '$folder': $_" "WARNING"
+            }
+        }
+    }
 }
 
 function Process-ExistingFiles {
@@ -1237,10 +1289,10 @@ function Process-ExistingFiles {
     }
     if ($IncludeSubdirectories) { $gciParams['Recurse'] = $true }
     
-    # Exclude files already in Processed or Failed folders
+    # Exclude files in Processed/Failed and the tool-table Backups folder
     $existingFiles = Get-ChildItem @gciParams | Where-Object {
         $rel = $_.FullName.Substring($WatchFolder.TrimEnd('\', '/').Length + 1)
-        $rel -notmatch '^(Processed|Failed)(\\|/)'
+        $rel -notmatch $global:WatchExcludeRegex
     }
     
     if ($existingFiles.Count -gt 0) {
@@ -1292,8 +1344,8 @@ function Start-SynchronousWatcher {
             }
 
             if (-not $result.TimedOut) {
-                # Skip files created in Processed or Failed subfolders
-                if ($result.Name -match '^(Processed|Failed)(\\|/)') { continue }
+                # Skip Processed/Failed and the tool-table Backups folder
+                if ($result.Name -match $global:WatchExcludeRegex) { continue }
                 
                 $filePath = Join-Path $WatchFolder $result.Name
                 Write-Log ""
@@ -1336,10 +1388,10 @@ function Start-AsynchronousWatcher {
     $global:WatcherFailed = $false
 
     # Event handler - just queues the file path (fast, no scope issues)
-    # Skips files created in Processed or Failed subfolders
+    # Skips Processed/Failed and the tool-table Backups folder
     $action = {
         $name = $Event.SourceEventArgs.Name
-        if ($name -notmatch '^(Processed|Failed)(\\|/)') {
+        if ($name -notmatch $global:WatchExcludeRegex) {
             $filePath = $Event.SourceEventArgs.FullPath
             $global:FileQueue.Enqueue($filePath)
         }
@@ -1434,7 +1486,7 @@ function Start-AsynchronousWatcher {
                     $watchBase = $WatchFolder.TrimEnd('\', '/')
                     $missed = Get-ChildItem @gciParams | Where-Object {
                         $rel = $_.FullName.Substring($watchBase.Length + 1)
-                        ($rel -notmatch '^(Processed|Failed)(\\|/)') -and
+                        ($rel -notmatch $global:WatchExcludeRegex) -and
                         ($_.LastWriteTime -lt $cutoff) -and
                         ($global:FileQueue -notcontains $_.FullName)
                     }
@@ -1473,7 +1525,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.6.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.6.1"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
@@ -1485,7 +1537,8 @@ function Start-FolderWatcher {
     Write-Log "File Filter:     $FileFilter"
     Write-Log "Subdirectories:  $IncludeSubdirectories"
     Write-Log "Retry Settings:  $MaxRetries attempts, ${RetryDelaySeconds}s delay"
-    Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] -> $ToolTableDestination (mode: $ToolTableTransferMode, backups: $ToolTableBackupCount in '$ToolTableBackupFolder')"
+    Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] + folder '$ToolTableFolder' -> $ToolTableDestination (mode: $ToolTableTransferMode)"
+    Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
     Write-Log "=============================================="
     
     # Initialize folders

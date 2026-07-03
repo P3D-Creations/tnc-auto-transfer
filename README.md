@@ -1,6 +1,6 @@
 # Heidenhain TNCcmd Automatic File Transfer
 
-> **Version:** 1.6.0 | **Date:** 2026-07-02 | **Author:** [Xander Luciano](https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer)
+> **Version:** 1.6.1 | **Date:** 2026-07-02 | **Author:** [Xander Luciano](https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer)
 
 Scripts for automatically sending files to Heidenhain CNC controllers over the network.
 
@@ -12,6 +12,7 @@ Drop an NC program into a watched folder and it is uploaded to the machine autom
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.6.1 | 2026-07-02 | **Fixed the tool-table destination path** (`TNC:\\table\\` → `TNC:\table\`), which was silently breaking the pre-transfer **backup**; added a dedicated **`ToolTables` folder** inside the watch folder (any file dropped there is sent as a tool table, never to the NC-program location) with **backups kept in its `Backups` subfolder**, both excluded from normal watching; added tool-table controls to the tray **Settings** dialog (Merge/Overwrite, open folder, browse-and-send) |
 | 1.6.0 | 2026-07-02 | Runs as a **Windows service** at boot (no login required); **system-tray monitor** with desktop toast notifications, settings GUI, live-log viewer, and "last sent file" status; fixed a transfer **hang** when the machine was unreachable (async I/O with a hard timeout); watcher **auto-recovery** from NAS/network drops plus a fallback rescan and heartbeat; distinct handling for **machine-unreachable vs. file-locked** retries; **DPAPI-encrypted NAS authentication** so the service can run as LocalSystem and still reach a network share; **JSON config overrides** editable from the tray; 3-hour service auto-restart safety net; log rotation |
 | 1.5.0 | 2026-03-23 | Tool-table routing to `TNC:\table\` with Merge or Overwrite modes and automatic timestamped backups |
 | 1.2.0 | 2026-03-21 | Added support for subdirectories, UNC paths, and overwriting existing programs on the machine |
@@ -85,7 +86,7 @@ Download from Heidenhain:
 - **Subdirectory mirroring** — watch subfolders and recreate the same folder tree on the controller (creates remote directories as needed)
 - **UNC / network-share watch folders** (e.g. a NAS path) supported
 - **Overwrite existing programs** on the control (`$DeleteBeforeTransfer`)
-- **Tool-table routing** — files such as `tool.t` are sent to `TNC:\table\` with Merge or Overwrite handling and an automatic timestamped backup of the current table first
+- **Tool-table routing** — files named `tool.t` (or anything dropped in the **`ToolTables`** folder) are sent to `TNC:\table\` with Merge or Overwrite handling. A timestamped backup of the current remote table is downloaded first (into `ToolTables\Backups`). See [Tool Tables](#tool-tables)
 - **Retry logic** — if the file is locked on the controller, retries up to 150 times (30s intervals)
 - **Machine-unreachable handling** — if the machine is off/unreachable, the file stays queued and transfers automatically once it returns (instead of failing), with a hard per-operation timeout so the script can never hang
 - Handles file locking (waits for files to finish copying)
@@ -139,7 +140,9 @@ $MaxRetries = 150                      # Maximum retry attempts
 $RetryDelaySeconds = 30                # Seconds between retries
 
 # Tool-table routing (optional)
-$ToolTableFiles = @("tool.t")          # Filenames routed to TNC:\table\ with backup + merge/overwrite
+$ToolTableFiles = @("tool.t")          # Filenames always treated as tool tables (any location)
+$ToolTableFolder = "ToolTables"        # Subfolder (in the watch folder) for tool tables; backups go in its \Backups
+$ToolTableDestination = "TNC:\table\"  # Where tool tables are sent on the CNC
 $ToolTableTransferMode = "Merge"       # "Merge" (needs TNCcmdPlus + Option 18) or "Overwrite"
 
 # NAS credential (optional) — see "NAS / Network-Share Authentication"
@@ -295,6 +298,10 @@ powershell -ExecutionPolicy Bypass -File ".\TNCcmd-FolderWatcher.ps1"
 - If the toast/log says **locked on controller**, the program is open or the machine is in **Running** mode — set it to **Manual** or close the program on the control to free it. The file transfers automatically once it's free.
 - If it says **machine unreachable**, the control is off or off the network; the file will send itself when the machine returns. No action needed.
 
+### Tool-table merge fails, or no backup appears
+- **Merge mode** requires **TNCcmdPlus** (USB dongle) + **Option 18 HEIDENHAIN DNC**. Without it, `PUT /m` isn't supported and the transfer fails safely (the remote table is left untouched). Switch `$ToolTableTransferMode` to **Overwrite** if you don't have TNCcmdPlus.
+- Backups are saved to `ToolTables\Backups` before each send. If none appear, confirm the machine is reachable (the backup is a download from the control) and that `TNC:\table\` is the correct destination for your controller. (In v1.6.1 a path-formatting bug that silently broke the backup download was fixed.)
+
 ---
 
 ## Running as a Windows Service (Recommended for 24-7)
@@ -344,11 +351,33 @@ All of these self-elevate (UAC) and are safe to re-run.
   - **Waiting to retry** — the file is *locked* on a reachable control (e.g. the NC program is still in **Running** mode); a reminder repeats every few minutes until it clears.
 
   > These are self-drawn windows, **not** Windows notifications, so they appear even if Settings → System → Notifications is turned off. Preview them any time with `TNCWatcher-Tray.exe --toasttest`.
-- **Settings dialog** (left-click the icon, or right-click → *Settings…*) — edit the watch folder (with a Browse button), machine IP, destination, file filter, retry counts, timeouts, and the NAS credential. *Save & Restart Service* applies everything with a single UAC prompt. Settings are written to `TNCWatcher-Config.json`, which overrides the values in the script.
+- **Settings dialog** (left-click the icon, or right-click → *Settings…*) — edit the watch folder (with a Browse button), machine IP, destination, file filter, retry counts, timeouts, the NAS credential, and the tool-table options (see [Tool Tables](#tool-tables)). *Save & Restart Service* applies everything with a single UAC prompt. Settings are written to `TNCWatcher-Config.json`, which overrides the values in the script.
 - **Last sent file** — the right-click menu shows the most recently transferred file and its timestamp.
 - **Quick actions** — open the live log window, open the watch folder, restart the service, or toggle start-with-Windows.
 
 To (re)build the EXE from source after editing `service/TNCWatcher-Tray.cs`, run **`service/Build-TrayApp.cmd`** (uses the C# compiler that ships with Windows — no SDK required).
+
+---
+
+## Tool Tables
+
+Tool tables (e.g. `tool.t`) are handled specially: they go to `TNC:\table\` on the control rather than the NC-program location, and the current remote table is always **backed up first**.
+
+**Two ways to send one:**
+
+- Drop it in the **`ToolTables`** folder inside your watch folder (created automatically). Anything placed there is treated as a tool table — never sent to the NC-program location.
+- Or use the tray **Settings → Tool tables → Browse && Send Tool Table…** button to pick a `.t` file; it's copied into the `ToolTables` folder for you. **Open Tool Table Folder** opens it in Explorer.
+
+**Backups.** Before every send, the current remote table is downloaded to `ToolTables\Backups` as `tool_YYYYMMDD_HHMMSS.t`. The most recent `$ToolTableBackupCount` (default 20) are kept; older ones are pruned. The `Backups` subfolder is excluded from watching, so a downloaded backup is never sent back to the machine.
+
+**Transfer mode** (`$ToolTableTransferMode`, or the tray dropdown):
+
+| Mode | What it does | Notes |
+|------|--------------|-------|
+| **Merge** (default) | `PUT /m` — merges the incoming rows into the existing table | Requires **TNCcmdPlus** (USB dongle) + **Option 18 HEIDENHAIN DNC**. If unsupported it fails safely; the remote table is left untouched. |
+| **Overwrite** | Deletes the remote table, then uploads the new one | Full replacement. A backup is still taken first. |
+
+On any failure the remote table is left unmodified and the incoming file is moved to the `Failed` folder.
 
 ---
 

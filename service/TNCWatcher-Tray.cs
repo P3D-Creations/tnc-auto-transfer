@@ -143,9 +143,20 @@ class WatcherConfig
     public int RetryDelaySeconds = 30;
     public int ConnectionTimeout = 30;
     public int TransferTimeoutSeconds = 600;
+    public string ToolTableTransferMode = "Merge";
+    public string ToolTableFolder = "ToolTables";
 
     public static string ConfigPath(string baseDir) { return Path.Combine(baseDir, "TNCWatcher-Config.json"); }
     public static string ScriptPath(string baseDir) { return Path.Combine(baseDir, "TNCcmd-FolderWatcher.ps1"); }
+
+    // Absolute path of the tool table folder (inside the watch folder unless an
+    // absolute path was configured).
+    public string ResolvedToolTableFolder()
+    {
+        string f = (ToolTableFolder == null || ToolTableFolder.Length == 0) ? "ToolTables" : ToolTableFolder;
+        try { if (Path.IsPathRooted(f)) return f; } catch { }
+        try { return Path.Combine(WatchFolder, f); } catch { return f; }
+    }
 
     public static WatcherConfig Load(string baseDir)
     {
@@ -170,6 +181,8 @@ class WatcherConfig
             RetryDelaySeconds      = MatchInt(text, "RetryDelaySeconds", RetryDelaySeconds);
             ConnectionTimeout      = MatchInt(text, "ConnectionTimeout", ConnectionTimeout);
             TransferTimeoutSeconds = MatchInt(text, "TransferTimeoutSeconds", TransferTimeoutSeconds);
+            ToolTableTransferMode  = MatchString(text, "ToolTableTransferMode", ToolTableTransferMode);
+            ToolTableFolder        = MatchString(text, "ToolTableFolder", ToolTableFolder);
         }
         catch { }
     }
@@ -211,6 +224,8 @@ class WatcherConfig
             if (d.TryGetValue("RetryDelaySeconds", out v) && v != null)      RetryDelaySeconds = ToInt(v, RetryDelaySeconds);
             if (d.TryGetValue("ConnectionTimeout", out v) && v != null)      ConnectionTimeout = ToInt(v, ConnectionTimeout);
             if (d.TryGetValue("TransferTimeoutSeconds", out v) && v != null) TransferTimeoutSeconds = ToInt(v, TransferTimeoutSeconds);
+            if (d.TryGetValue("ToolTableTransferMode", out v) && v != null)  ToolTableTransferMode = v.ToString();
+            if (d.TryGetValue("ToolTableFolder", out v) && v != null)        ToolTableFolder = v.ToString();
         }
         catch { }
     }
@@ -233,6 +248,8 @@ class WatcherConfig
         d["RetryDelaySeconds"]      = RetryDelaySeconds;
         d["ConnectionTimeout"]      = ConnectionTimeout;
         d["TransferTimeoutSeconds"] = TransferTimeoutSeconds;
+        d["ToolTableTransferMode"]  = ToolTableTransferMode;
+        d["ToolTableFolder"]        = ToolTableFolder;
         JavaScriptSerializer ser = new JavaScriptSerializer();
         File.WriteAllText(ConfigPath(baseDir), ser.Serialize(d));
     }
@@ -247,6 +264,8 @@ class SettingsForm : Form
     TextBox tbIP, tbDest, tbWatch, tbFilter, tbRetries, tbDelay, tbConnTimeout, tbXferTimeout;
     TextBox tbNasUser, tbNasPass;
     CheckBox cbSubdirs;
+    ComboBox cbToolMode;
+    string loadedToolTableFolder = "ToolTables"; // preserved across save (no UI field)
 
     public SettingsForm(string baseDir)
     {
@@ -257,7 +276,7 @@ class SettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(520, 478);
+        ClientSize = new Size(520, 600);
         Font = new Font("Segoe UI", 9F);
 
         int y = 14;
@@ -293,6 +312,43 @@ class SettingsForm : Form
         ln.SetBounds(372, 24, 120, 60);
         grp.Controls.Add(ln);
         y += 106;
+
+        // ---- Tool tables ----
+        GroupBox ttGrp = new GroupBox();
+        ttGrp.Text = "Tool tables";
+        ttGrp.SetBounds(12, y, 496, 116);
+        Controls.Add(ttGrp);
+
+        Label lm = new Label(); lm.Text = "Transfer mode:"; lm.SetBounds(12, 26, 150, 20); ttGrp.Controls.Add(lm);
+        cbToolMode = new ComboBox();
+        cbToolMode.DropDownStyle = ComboBoxStyle.DropDownList;
+        cbToolMode.Items.AddRange(new object[] { "Merge", "Overwrite" });
+        cbToolMode.SetBounds(166, 24, 140, 23);
+        ttGrp.Controls.Add(cbToolMode);
+        Label lmn = new Label();
+        lmn.Text = "Merge needs TNCcmdPlus + Option 18.";
+        lmn.ForeColor = Color.DimGray;
+        lmn.SetBounds(316, 27, 176, 20);
+        ttGrp.Controls.Add(lmn);
+
+        Label lf = new Label();
+        lf.Text = "Drop tool tables (e.g. tool.t) in the tool table folder. A backup of the current\nremote table is saved before every send.";
+        lf.ForeColor = Color.DimGray;
+        lf.SetBounds(12, 52, 472, 32);
+        ttGrp.Controls.Add(lf);
+
+        Button btnOpenTT = new Button();
+        btnOpenTT.Text = "Open Tool Table Folder";
+        btnOpenTT.SetBounds(12, 84, 170, 26);
+        btnOpenTT.Click += delegate { OpenToolTableFolder(); };
+        ttGrp.Controls.Add(btnOpenTT);
+
+        Button btnSendTT = new Button();
+        btnSendTT.Text = "Browse && Send Tool Table…";
+        btnSendTT.SetBounds(192, 84, 190, 26);
+        btnSendTT.Click += delegate { BrowseAndSendToolTable(); };
+        ttGrp.Controls.Add(btnSendTT);
+        y += 126;
 
         Label note = new Label();
         note.Text = "\"Save && Restart Service\" applies everything (admin prompt appears).";
@@ -377,6 +433,8 @@ class SettingsForm : Form
         tbDelay.Text       = c.RetryDelaySeconds.ToString();
         tbConnTimeout.Text = c.ConnectionTimeout.ToString();
         tbXferTimeout.Text = c.TransferTimeoutSeconds.ToString();
+        cbToolMode.SelectedItem = (c.ToolTableTransferMode == "Overwrite") ? "Overwrite" : "Merge";
+        loadedToolTableFolder = c.ToolTableFolder;
     }
 
     bool SaveAll()
@@ -420,6 +478,8 @@ class SettingsForm : Form
             c.RetryDelaySeconds = delay;
             c.ConnectionTimeout = connT;
             c.TransferTimeoutSeconds = xferT;
+            c.ToolTableTransferMode = (cbToolMode.SelectedItem != null) ? cbToolMode.SelectedItem.ToString() : "Merge";
+            c.ToolTableFolder = loadedToolTableFolder;
             c.SaveJson(baseDir);
         }
         catch (Exception ex)
@@ -464,6 +524,70 @@ class SettingsForm : Form
         {
             MessageBox.Show(this, "Admin prompt was declined - settings are saved but the service was NOT restarted.\nUse \"Restart Service\" in the tray menu to apply them later.",
                 "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    // Resolve the tool table folder from what's currently typed in the dialog,
+    // so it tracks an edited (but unsaved) watch folder path.
+    string CurrentToolTableFolder()
+    {
+        string folder = (loadedToolTableFolder == null || loadedToolTableFolder.Length == 0)
+            ? "ToolTables" : loadedToolTableFolder;
+        try { if (Path.IsPathRooted(folder)) return folder; } catch { }
+        try { return Path.Combine(tbWatch.Text.Trim(), folder); } catch { return folder; }
+    }
+
+    void OpenToolTableFolder()
+    {
+        string folder = CurrentToolTableFolder();
+        try
+        {
+            if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+            Process.Start("explorer.exe", "\"" + folder + "\"");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "Could not open the tool table folder:\n" + folder + "\n\n" + ex.Message,
+                "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    void BrowseAndSendToolTable()
+    {
+        string folder = CurrentToolTableFolder();
+        using (OpenFileDialog dlg = new OpenFileDialog())
+        {
+            dlg.Title = "Select a tool table file to send";
+            dlg.Filter = "Tool tables (*.t)|*.t|All files (*.*)|*.*";
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+
+            string src = dlg.FileName;
+            string dest = Path.Combine(folder, Path.GetFileName(src));
+            try
+            {
+                if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+
+                if (File.Exists(dest))
+                {
+                    DialogResult r = MessageBox.Show(this,
+                        Path.GetFileName(dest) + " is already in the tool table folder. Replace it and send again?",
+                        "TNCWatcher", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                    if (r != DialogResult.Yes) return;
+                }
+
+                File.Copy(src, dest, true);
+                MessageBox.Show(this,
+                    "Copied " + Path.GetFileName(src) + " into the tool table folder.\n\n" +
+                    "The watcher will back up the current remote table and send it (" +
+                    (cbToolMode.SelectedItem != null ? cbToolMode.SelectedItem.ToString() : "Merge") +
+                    " mode). Watch the tray/live log for progress.",
+                    "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Could not copy the tool table into the folder:\n" + ex.Message,
+                    "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
     }
 }
