@@ -168,6 +168,27 @@ $ToolTableTransferMode = "Merge"   # "Merge" | "Overwrite"
 $ToolTableBackupCount  = 20                      # Max number of backups to keep
 
 # ------------------------------
+# IGNORED FILES (system / hidden junk)
+# ------------------------------
+
+# When $true, any file or folder whose name (in ANY path segment) matches one of
+# $IgnoreFilePatterns is silently ignored: never transmitted to the machine, and
+# never written to the log or shown in a toast. This keeps OS metadata that a
+# Mac/Windows/NAS sprinkles into shared folders from cluttering things up.
+# Covers macOS (.DS_Store, ._ resource forks, .Spotlight-V100, .Trashes,
+# .fseventsd, ...), Windows (Thumbs.db, desktop.ini, ~$ Office lock files), and
+# Synology (@eaDir index folders, @SynoResource / @SynoEAStream). Any file whose
+# Hidden or System attribute is set is also skipped. Matched case-insensitively.
+$IgnoreSystemFiles  = $true
+$IgnoreFilePatterns = @(
+    '(^|[\\/])\.',                                     # any dotfile / dotfolder (hidden)
+    '(^|[\\/])~\$',                                    # Office temp / lock files (~$...)
+    '(^|[\\/])(Thumbs\.db|ehthumbs\.db|desktop\.ini)([\\/]|$)',
+    '(^|[\\/])@eaDir([\\/]|$)',                        # Synology index folder
+    '@Syno'                                            # @SynoResource / @SynoEAStream suffixes
+)
+
+# ------------------------------
 # RETRY SETTINGS
 # ------------------------------
 
@@ -245,6 +266,14 @@ if ($backupTrim.ToLower().StartsWith(($WatchBaseForExclude + '\').ToLower())) {
     $excludeNames += [regex]::Escape($backupRel)
 }
 $global:WatchExcludeRegex = '^(' + ($excludeNames -join '|') + ')(\\|/)'
+
+# Regex matching system/hidden junk to ignore entirely (see $IgnoreFilePatterns).
+# '(?!)' never matches, so setting $IgnoreSystemFiles = $false disables it.
+$global:IgnoreRegex = if ($IgnoreSystemFiles -and $IgnoreFilePatterns.Count -gt 0) {
+    '(?i)' + ($IgnoreFilePatterns -join '|')
+} else {
+    '(?!)'
+}
 
 # ============================================================================
 # FUNCTIONS
@@ -1151,9 +1180,23 @@ function Process-SingleFile {
         merge semantics via Send-ToolTableFile.
     #>
     param([string]$FilePath)
-    
+
     $fileName = [System.IO.Path]::GetFileName($FilePath)
-    
+
+    # Silently ignore system/hidden junk (never log or transmit). This is a
+    # safety net; the watchers already filter these out before logging. Matches
+    # on the path relative to the watch folder so junk in subfolders is caught.
+    $watchBaseIg = $WatchFolder.TrimEnd('\', '/')
+    $relIg = if ($FilePath.Length -gt ($watchBaseIg.Length + 1)) { $FilePath.Substring($watchBaseIg.Length + 1) } else { $fileName }
+    if ($relIg -match $global:IgnoreRegex) { return }
+
+    # Also skip anything the OS has flagged Hidden or System (belt-and-suspenders)
+    try {
+        $item = Get-Item -LiteralPath $FilePath -Force -ErrorAction Stop
+        if ($item.Attributes -band ([System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)) { return }
+    }
+    catch {}
+
     # Verify file still exists
     if (-not (Test-Path $FilePath)) {
         Write-Log "File no longer exists, skipping: $fileName" "WARNING"
@@ -1289,10 +1332,10 @@ function Process-ExistingFiles {
     }
     if ($IncludeSubdirectories) { $gciParams['Recurse'] = $true }
     
-    # Exclude files in Processed/Failed and the tool-table Backups folder
+    # Exclude Processed/Failed, the tool-table Backups folder, and system/hidden junk
     $existingFiles = Get-ChildItem @gciParams | Where-Object {
         $rel = $_.FullName.Substring($WatchFolder.TrimEnd('\', '/').Length + 1)
-        $rel -notmatch $global:WatchExcludeRegex
+        ($rel -notmatch $global:WatchExcludeRegex) -and ($rel -notmatch $global:IgnoreRegex)
     }
     
     if ($existingFiles.Count -gt 0) {
@@ -1344,8 +1387,8 @@ function Start-SynchronousWatcher {
             }
 
             if (-not $result.TimedOut) {
-                # Skip Processed/Failed and the tool-table Backups folder
-                if ($result.Name -match $global:WatchExcludeRegex) { continue }
+                # Skip Processed/Failed, tool-table Backups, and system/hidden junk
+                if ($result.Name -match $global:WatchExcludeRegex -or $result.Name -match $global:IgnoreRegex) { continue }
                 
                 $filePath = Join-Path $WatchFolder $result.Name
                 Write-Log ""
@@ -1388,10 +1431,11 @@ function Start-AsynchronousWatcher {
     $global:WatcherFailed = $false
 
     # Event handler - just queues the file path (fast, no scope issues)
-    # Skips Processed/Failed and the tool-table Backups folder
+    # Skips Processed/Failed, the tool-table Backups folder, and system/hidden
+    # junk (so junk never even reaches the log).
     $action = {
         $name = $Event.SourceEventArgs.Name
-        if ($name -notmatch $global:WatchExcludeRegex) {
+        if ($name -notmatch $global:WatchExcludeRegex -and $name -notmatch $global:IgnoreRegex) {
             $filePath = $Event.SourceEventArgs.FullPath
             $global:FileQueue.Enqueue($filePath)
         }
@@ -1487,6 +1531,7 @@ function Start-AsynchronousWatcher {
                     $missed = Get-ChildItem @gciParams | Where-Object {
                         $rel = $_.FullName.Substring($watchBase.Length + 1)
                         ($rel -notmatch $global:WatchExcludeRegex) -and
+                        ($rel -notmatch $global:IgnoreRegex) -and
                         ($_.LastWriteTime -lt $cutoff) -and
                         ($global:FileQueue -notcontains $_.FullName)
                     }
@@ -1539,6 +1584,7 @@ function Start-FolderWatcher {
     Write-Log "Retry Settings:  $MaxRetries attempts, ${RetryDelaySeconds}s delay"
     Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] + folder '$ToolTableFolder' -> $ToolTableDestination (mode: $ToolTableTransferMode)"
     Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
+    Write-Log "Ignore Junk:     $(if ($IgnoreSystemFiles) { 'on (system/hidden files silently skipped)' } else { 'off' })"
     Write-Log "=============================================="
     
     # Initialize folders
