@@ -22,3 +22,6 @@ service/*
 !service/Build-TrayApp.cmd
 !service/Apply-TrayConfig.ps1
 !service/TNCWatcher-3h-Restart.xml
+!service/TNCWatcher-StlPrep.cs
+!service/Build-StlPrep.cmd
+!service/stl-test.py
