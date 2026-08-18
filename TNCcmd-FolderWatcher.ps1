@@ -213,7 +213,8 @@ $IgnoreFilePatterns = @(
     '(^|[\\/])~\$',                                    # Office temp / lock files (~$...)
     '(^|[\\/])(Thumbs\.db|ehthumbs\.db|desktop\.ini)([\\/]|$)',
     '(^|[\\/])@eaDir([\\/]|$)',                        # Synology index folder
-    '@Syno'                                            # @SynoResource / @SynoEAStream suffixes
+    '@Syno',                                           # @SynoResource / @SynoEAStream suffixes
+    '\.(failed|tmp|bak|old|part|partial|crdownload|swp)$'  # post/editor leftovers, e.g. "Prog.h.failed"
 )
 
 # ------------------------------
