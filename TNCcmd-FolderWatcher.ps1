@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.7.0
+  Version: 1.7.1
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -189,6 +189,21 @@ $FixtureClearanceMM = 1.5       # each fixture face moves inward this far, to st
 # binary PUT.
 $StlAsciiOutput    = $true
 
+# The post writes the NC file at the parent level while posting, then moves it
+# into the per-program subfolder in onTerminate(). Without a delay the watcher
+# grabs that transient copy, uploads it to the wrong place, and can even move it
+# to Processed out from under the post's own move.
+#
+# Two guards, belt and braces:
+#   1. Wait this long before sending an NC program, then re-check it is still
+#      there. If the post moved it away, that copy is skipped silently.
+#   2. Structural check: if a SUBFOLDER of this file's folder holds a sidecar
+#      naming this NC file, the copy in hand is the transient one and the
+#      subfolder copy is authoritative.
+# Set the delay to 0 to disable both.
+$NcSettleDelaySeconds = 15
+$NcSettleExtensions   = @(".h", ".i")
+
 $StlMetaSchema           = "p3d.kern.fixture-stl-meta"
 $StlMetaMaxSchemaVersion = 1    # refuse anything newer rather than guess
 
@@ -223,8 +238,14 @@ $IgnoreFilePatterns = @(
     '(^|[\\/])(Thumbs\.db|ehthumbs\.db|desktop\.ini)([\\/]|$)',
     '(^|[\\/])@eaDir([\\/]|$)',                        # Synology index folder
     '@Syno',                                           # @SynoResource / @SynoEAStream suffixes
-    '\.(failed|tmp|bak|old|part|partial|crdownload|swp)$'  # post/editor leftovers, e.g. "Prog.h.failed"
+    '\.(tmp|bak|old|part|partial|crdownload|swp)$'     # editor / half-written leftovers
 )
+
+# Files that are NEVER sent to the machine but ARE worth keeping: they get
+# filed into the Processed folder alongside the program they came from, so a
+# failed post can still be reviewed afterwards instead of being left loose in
+# the watch folder. Matched on extension, case-insensitively.
+$ArchiveOnlyExtensions = @(".failed", ".log")
 
 # ------------------------------
 # RETRY SETTINGS
@@ -1493,6 +1514,28 @@ function Send-StlBundle {
     }
 }
 
+function Test-TransientNcCopy {
+    <#
+    .SYNOPSIS
+        True if this NC file is the post's transient pre-move copy: a SUBFOLDER
+        of its own folder contains a metadata sidecar naming this NC file, which
+        means the authoritative copy lives in that subfolder.
+    #>
+    param([string]$FilePath)
+
+    $dir  = [System.IO.Path]::GetDirectoryName($FilePath)
+    $name = [System.IO.Path]::GetFileName($FilePath)
+
+    foreach ($sub in @(Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue)) {
+        if ($sub.Name -ieq 'Processed' -or $sub.Name -ieq 'Failed') { continue }
+        foreach ($j in @(Get-ChildItem -Path $sub.FullName -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+            $m = Get-StlMeta -Path $j.FullName
+            if ($m -and $m.program -and ([string]$m.program.ncFile -ieq $name)) { return $true }
+        }
+    }
+    return $false
+}
+
 function Find-StlMetaFor {
     <#
     .SYNOPSIS
@@ -1582,6 +1625,15 @@ function Process-SingleFile {
         # went (flat layout), so send the meshes now.
         $ncName = if ($meta.program) { [string]$meta.program.ncFile } else { $null }
         $ncPath = if ($ncName) { Join-Path ([System.IO.Path]::GetDirectoryName($FilePath)) $ncName } else { $null }
+
+        # In the subfolder layout the sidecar is written before the NC file is
+        # moved in, so "not there yet" and "already transferred" look identical
+        # at this instant. Give the move the same settle window before deciding,
+        # otherwise the meshes could be sent ahead of their program.
+        if ($ncPath -and -not (Test-Path $ncPath) -and $NcSettleDelaySeconds -gt 0) {
+            Start-Sleep -Seconds $NcSettleDelaySeconds
+        }
+
         if ($ncPath -and (Test-Path $ncPath)) {
             Write-Log "STL sidecar staged; waiting for its program to transfer first: $ncName" "DEBUG"
             return
@@ -1590,6 +1642,31 @@ function Process-SingleFile {
         $remote = Get-RemoteDestinationFor -FilePath $FilePath
         Send-StlBundle -MetaFile $FilePath -RemotePath $remote
         return
+    }
+
+    # ---- archive-only files ----------------------------------------------
+    # Never transmitted, but kept: filed into Processed with the rest of the
+    # program's files so a failed post is still there to look at.
+    if ($ArchiveOnlyExtensions -contains $ext.ToLower()) {
+        Write-Log "Archiving for review (not sent to the machine): $fileName"
+        Move-ProcessedFile -FilePath $FilePath -Success $true
+        return
+    }
+
+    # ---- NC program settle gate ------------------------------------------
+    # Let the post finish relocating the program before touching it, then make
+    # sure the copy in hand is the real one and not the pre-move transient.
+    if ($NcSettleDelaySeconds -gt 0 -and ($NcSettleExtensions -contains $ext.ToLower())) {
+        Start-Sleep -Seconds $NcSettleDelaySeconds
+
+        if (-not (Test-Path $FilePath)) {
+            Write-Log "Program was relocated by the post during the settle delay; skipping that copy: $fileName" "DEBUG"
+            return
+        }
+        if (Test-TransientNcCopy -FilePath $FilePath) {
+            Write-Log "Skipping transient copy of $fileName - the authoritative copy is in its program subfolder." "DEBUG"
+            return
+        }
     }
 
     # Check if this is a tool table needing special routing: either the filename
@@ -1946,7 +2023,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.7.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.7.1"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
