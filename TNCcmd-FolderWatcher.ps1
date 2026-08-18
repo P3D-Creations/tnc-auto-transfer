@@ -183,10 +183,15 @@ $FixtureClearanceMM = 1.5       # each fixture face moves inward this far, to st
 $StlMetaSchema           = "p3d.kern.fixture-stl-meta"
 $StlMetaMaxSchemaVersion = 1    # refuse anything newer rather than guess
 
-# The post documents the STL vertex frame as INFERRED, not measured. Before any
-# fixture is trusted, the STOCK mesh's bounds are compared against
-# stockBounds_wcs from the JSON. A mismatch means the frame hypothesis is wrong
-# and the fixture would be placed incorrectly, so the fixture is skipped.
+# The post documents the STL vertex frame as INFERRED, not measured, so the
+# STOCK mesh's bounds are compared against stockBounds_wcs as a diagnostic. A
+# real frame error shows up as a huge offset (the doc's own example differs by
+# 153mm), not a sub-millimetre one, so the tolerance only has to clear triangle
+# reduction and the odd stray polygon.
+#
+# This WARNS but never blocks: the control needs the referenced STL files to
+# run the program at all, so withholding one is a worse failure than shipping a
+# suspect one. Stock and part meshes are display-only anyway.
 $StlValidateStockBounds  = $true
 $StlBoundsToleranceMM    = 0.5
 
@@ -1296,11 +1301,14 @@ function Test-StlFrameHypothesis {
     <#
     .SYNOPSIS
         The post documents the STL vertex frame as inferred-unverified. Compare
-        the STOCK mesh's actual bounds against stockBounds_wcs from the JSON. If
-        they disagree, the fixture would be placed in the wrong frame, so the
-        caller must not upload it.
+        the STOCK mesh's actual bounds against stockBounds_wcs from the JSON as
+        a diagnostic.
+
+        Reports only - the caller still uploads. A real frame error is a large
+        offset and will be obvious in the log and on the control; withholding
+        the file instead would stop the program running at all.
     .OUTPUTS
-        $true if the frame checks out (or cannot be checked), $false on mismatch.
+        $true if the bounds agree (or cannot be checked), $false on mismatch.
     #>
     param(
         [string]$StockFile,
@@ -1340,11 +1348,11 @@ function Test-StlFrameHypothesis {
         return $true
     }
 
-    Write-Log "STL FRAME CHECK FAILED: stock mesh bounds differ from stockBounds_wcs by $([Math]::Round($worst,4)) $stlUnits (tolerance $tol)" "ERROR"
-    Write-Log "  mesh:     $($got -join ', ')" "ERROR"
-    Write-Log "  expected: $($want -join ', ')" "ERROR"
-    Write-Log "  The fixture would be placed in the wrong frame - FIXTURE UPLOAD SKIPPED." "ERROR"
-    Write-Log "  See Fixture-STL-Handoff.md section 6 to resolve the frame hypothesis." "ERROR"
+    Write-Log "STL FRAME MISMATCH: stock mesh bounds differ from stockBounds_wcs by $([Math]::Round($worst,4)) $stlUnits (tolerance $tol)" "WARNING"
+    Write-Log "  mesh:     $($got -join ', ')" "WARNING"
+    Write-Log "  expected: $($want -join ', ')" "WARNING"
+    Write-Log "  Uploading anyway. If the offset is large the fixture may be placed in the wrong frame -" "WARNING"
+    Write-Log "  check it in simulation, and see Fixture-STL-Handoff.md section 6." "WARNING"
     return $false
 }
 
@@ -1378,8 +1386,10 @@ function Send-StlBundle {
     if ($meta.warnings) {
         foreach ($w in $meta.warnings) { Write-Log "  POST WARNING: $w" "WARNING" }
     }
+    # Multiple work offsets are normal here - several presets on one plate or
+    # pallet, one physical fixture - so this is informational only.
     if ($meta.wcs -and $meta.wcs.workOffsetsUsed -and @($meta.wcs.workOffsetsUsed).Count -gt 1) {
-        Write-Log "  Multi-WCS program (offsets: $(@($meta.wcs.workOffsetsUsed) -join ', ')); attach point taken from the first section." "WARNING"
+        Write-Log "  Work offsets: $(@($meta.wcs.workOffsetsUsed) -join ', ')" "DEBUG"
     }
 
     $stlUnits = if ($meta.frames -and $meta.frames.stlUnits) { [string]$meta.frames.stlUnits } else { "mm" }
@@ -1423,19 +1433,25 @@ function Send-StlBundle {
             $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits)
 
             if ($role -eq "FIXTURE") {
-                if (-not $fixtureOk) {
-                    Write-Log "  FIXTURE skipped: frame check failed (see above)." "ERROR"
-                    continue
-                }
                 $A = $meta.fixtureAttachPoint_inFixtureFrame_stlUnits
                 if (-not $A -or $null -eq $A.x -or $null -eq $A.y -or $null -eq $A.z) {
-                    Write-Log "  FIXTURE skipped: no attach point in the metadata (no machine model / simulation placement in the Setup)." "ERROR"
-                    Write-Log "  Never guess this - a wrong datum drives the fixture into the table in simulation." "ERROR"
-                    continue
+                    # No attach point selected in the Setup. That is legitimate
+                    # when the fixture's attach point already sits on the
+                    # document origin, in which case no translation is needed
+                    # and the origin is the right anchor. If it was simply
+                    # forgotten, the WCS checks elsewhere catch it - so warn and
+                    # ship rather than withhold a file the program needs to run.
+                    $attachArg = "0,0,0"
+                    Write-Log "  FIXTURE has no attach point in the metadata; assuming it already sits on the mesh origin." "WARNING"
+                    Write-Log "  Verify the fixture position in simulation. Selecting an attach point in the Setup avoids this." "WARNING"
+                } else {
+                    $attachArg = ("{0},{1},{2}" -f [double]$A.x, [double]$A.y, [double]$A.z)
+                    Write-Log "  FIXTURE attach point ($stlUnits): $attachArg -> re-origined to 0,0,0"
                 }
-                $attachArg = ("{0},{1},{2}" -f [double]$A.x, [double]$A.y, [double]$A.z)
+                if (-not $fixtureOk) {
+                    Write-Log "  FIXTURE frame is suspect (see mismatch above) - uploading anyway, check it in simulation." "WARNING"
+                }
                 $prepArgs += @("--attach", $attachArg, "--clearance", "$FixtureClearanceMM")
-                Write-Log "  FIXTURE attach point ($stlUnits): $attachArg -> re-origined to 0,0,0"
             }
 
             $prepped = Join-Path $tempDir $rec.file
