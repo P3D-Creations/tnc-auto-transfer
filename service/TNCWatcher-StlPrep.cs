@@ -225,6 +225,45 @@ static class StlIO
         return m;
     }
 
+    // ASCII STL. Larger than binary (~4.6x) but line-based, which matters:
+    // the TNC 640 rejects a long run of bytes with no line break during PUT
+    // with "E20001714: Formatting error", even in /b binary mode. A 1.5MB
+    // binary STL fails; the same 1.5MB with newlines every 80 bytes succeeds,
+    // as does a 25MB NC program. So meshes go as text.
+    public static void WriteAscii(string path, Mesh m)
+    {
+        string tmp = path + ".tmp";
+        using (FileStream fs = new FileStream(tmp, FileMode.Create, FileAccess.Write))
+        using (StreamWriter w = new StreamWriter(fs, new UTF8Encoding(false)))
+        {
+            w.NewLine = "\n";
+            w.WriteLine("solid TNCWatcher");
+            int nt = m.TriangleCount;
+            for (int t = 0; t < nt; t++)
+            {
+                Vec3 a = m.Verts[m.Tris[t * 3]];
+                Vec3 b = m.Verts[m.Tris[t * 3 + 1]];
+                Vec3 c = m.Verts[m.Tris[t * 3 + 2]];
+                Vec3 n = (b - a).Cross(c - a).Normalized();
+                w.WriteLine("  facet normal " + A(n.X) + " " + A(n.Y) + " " + A(n.Z));
+                w.WriteLine("    outer loop");
+                w.WriteLine("      vertex " + A(a.X) + " " + A(a.Y) + " " + A(a.Z));
+                w.WriteLine("      vertex " + A(b.X) + " " + A(b.Y) + " " + A(b.Z));
+                w.WriteLine("      vertex " + A(c.X) + " " + A(c.Y) + " " + A(c.Z));
+                w.WriteLine("    endloop");
+                w.WriteLine("  endfacet");
+            }
+            w.WriteLine("endsolid TNCWatcher");
+        }
+        if (File.Exists(path)) File.Delete(path);
+        File.Move(tmp, path);
+    }
+
+    static string A(double v)
+    {
+        return ((float)v).ToString("0.000000e+00", CultureInfo.InvariantCulture);
+    }
+
     public static void WriteBinary(string path, Mesh m)
     {
         // Write to a temp file then move, so a reader never sees a partial STL.
@@ -646,6 +685,7 @@ static class Program
         bool quiet = false;
         bool translate = true;      // --attach re-origins the mesh (see below)
         bool probe = false;
+        bool ascii = false;
         string stlUnits = "mm";
 
         for (int i = 2; i < args.Length; i++)
@@ -671,6 +711,7 @@ static class Program
             }
             else if (a == "--no-translate") translate = false;
             else if (a == "--probe") probe = true;
+            else if (a == "--ascii") ascii = true;
             else if (a == "--quiet") quiet = true;
             else { Console.Error.WriteLine("Unknown option: " + a); Usage(); return 1; }
         }
@@ -814,7 +855,7 @@ static class Program
             }
         }
 
-        try { StlIO.WriteBinary(output, mesh); }
+        try { if (ascii) StlIO.WriteAscii(output, mesh); else StlIO.WriteBinary(output, mesh); }
         catch (Exception ex) { Console.Error.WriteLine("WRITE FAILED: " + ex.Message); return 3; }
 
         if (!quiet)
@@ -833,6 +874,7 @@ static class Program
             sb.Append(",\"maxDeviation\":").Append(F(deviation));
             sb.Append(",\"translated\":").Append(translated ? "true" : "false");
             sb.Append(",\"stlUnits\":\"").Append(stlUnits).Append("\"");
+            sb.Append(",\"format\":\"").Append(ascii ? "ascii" : "binary").Append("\"");
             sb.Append(",\"clearanceApplied\":").Append(F(scaled ? clearMesh : 0));
             sb.Append(",\"scaled\":").Append(scaled ? "true" : "false");
             sb.Append(",\"vertsBelowAnchor\":").Append(vertsBelowAnchor);
@@ -917,6 +959,8 @@ static class Program
         Console.Error.WriteLine("  --stl-units U    mm|in - unit of the mesh vertices (default mm). --clearance");
         Console.Error.WriteLine("                   is always mm and is converted to match.");
         Console.Error.WriteLine("  --probe          report as-read bounds only; write nothing");
+        Console.Error.WriteLine("  --ascii          write ASCII STL instead of binary. Required for the TNC 640:");
+        Console.Error.WriteLine("                   it rejects long runs of bytes with no line break on PUT.");
         Console.Error.WriteLine("  --quiet          suppress the JSON report");
     }
 }

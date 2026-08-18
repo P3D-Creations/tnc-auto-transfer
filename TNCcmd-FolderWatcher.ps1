@@ -180,6 +180,15 @@ $StlPrepExe        = ".\TNCWatcher-StlPrep.exe"  # relative to this script, or a
 $StlMaxTriangles   = 19500      # control's limit is 20000; margin for safety
 $FixtureClearanceMM = 1.5       # each fixture face moves inward this far, to stop DCM tripping
 
+# Send meshes as ASCII STL rather than binary. The TNC 640 rejects a long run
+# of bytes containing no line break during PUT, even in /b (binary 1:1) mode,
+# with "E20001714: Formatting error". Measured on this machine: a 1.5MB binary
+# STL fails; the identical 1.5MB with a newline every 80 bytes succeeds, as
+# does a 25MB NC program. ASCII STL is ~4.6x larger but line-based, so it
+# transfers reliably. Only set this false if a future control firmware fixes
+# binary PUT.
+$StlAsciiOutput    = $true
+
 $StlMetaSchema           = "p3d.kern.fixture-stl-meta"
 $StlMetaMaxSchemaVersion = 1    # refuse anything newer rather than guess
 
@@ -1432,6 +1441,7 @@ function Send-StlBundle {
             }
 
             $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits)
+            if ($StlAsciiOutput) { $prepArgs += "--ascii" }
 
             if ($role -eq "FIXTURE") {
                 $A = $meta.fixtureAttachPoint_inFixtureFrame_stlUnits
