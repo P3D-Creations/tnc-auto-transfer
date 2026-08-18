@@ -25,3 +25,5 @@ service/*
 !service/TNCWatcher-StlPrep.cs
 !service/Build-StlPrep.cmd
 !service/stl-test.py
+!service/stl-bundle-test.ps1
+!service/stl-bundle-make.py

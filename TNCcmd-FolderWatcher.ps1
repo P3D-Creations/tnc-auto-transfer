@@ -168,6 +168,29 @@ $ToolTableTransferMode = "Merge"   # "Merge" | "Overwrite"
 $ToolTableBackupCount  = 20                      # Max number of backups to keep
 
 # ------------------------------
+# STL TRANSFER (machine simulation / collision monitoring)
+# ------------------------------
+
+# The Kern post (kern_beta.cps) can emit STOCK/PART/FIXTURE meshes plus a
+# metadata sidecar alongside each program. Schema: p3d.kern.fixture-stl-meta.
+# See Kern\Documentation\Fixture-STL-Handoff.md.
+$EnableStlTransfer = $true
+
+$StlPrepExe        = ".\TNCWatcher-StlPrep.exe"  # relative to this script, or absolute
+$StlMaxTriangles   = 19500      # control's limit is 20000; margin for safety
+$FixtureClearanceMM = 1.5       # each fixture face moves inward this far, to stop DCM tripping
+
+$StlMetaSchema           = "p3d.kern.fixture-stl-meta"
+$StlMetaMaxSchemaVersion = 1    # refuse anything newer rather than guess
+
+# The post documents the STL vertex frame as INFERRED, not measured. Before any
+# fixture is trusted, the STOCK mesh's bounds are compared against
+# stockBounds_wcs from the JSON. A mismatch means the frame hypothesis is wrong
+# and the fixture would be placed incorrectly, so the fixture is skipped.
+$StlValidateStockBounds  = $true
+$StlBoundsToleranceMM    = 0.5
+
+# ------------------------------
 # IGNORED FILES (system / hidden junk)
 # ------------------------------
 
@@ -248,6 +271,7 @@ if (Test-Path $ConfigFile) {
 $WatchFolder = if ([System.IO.Path]::IsPathRooted($WatchFolder)) { $WatchFolder } else { Join-Path $ScriptDir $WatchFolder }
 $LogFile = if ([System.IO.Path]::IsPathRooted($LogFile)) { $LogFile } else { Join-Path $ScriptDir $LogFile }
 $NASCredentialFile = if ([System.IO.Path]::IsPathRooted($NASCredentialFile)) { $NASCredentialFile } else { Join-Path $ScriptDir $NASCredentialFile }
+$StlPrepExe = if ([System.IO.Path]::IsPathRooted($StlPrepExe)) { $StlPrepExe } else { Join-Path $ScriptDir $StlPrepExe }
 
 # Tool table folder lives inside the watch folder unless an absolute path was
 # given; backups go in its "Backups" subfolder.
@@ -1171,6 +1195,297 @@ function Send-ToolTableFile {
     }
 }
 
+function Get-RemoteDestinationFor {
+    <#
+    .SYNOPSIS
+        Maps a file in the watch folder to its destination folder on the
+        control, mirroring any subfolder structure. Optionally creates the
+        remote directory tree.
+    #>
+    param(
+        [string]$FilePath,
+        [bool]$CreateRemote = $false
+    )
+
+    $watchBase = $WatchFolder.TrimEnd('\', '/')
+    $relativePath = $FilePath.Substring($watchBase.Length + 1)
+    $relativeDir = [System.IO.Path]::GetDirectoryName($relativePath)
+
+    if ($relativeDir) {
+        $destPath = $DestinationFolder.TrimEnd('\', '/') + '\' + $relativeDir.Replace('/', '\')
+        if ($CreateRemote) {
+            Write-Log "Creating remote directory: $destPath"
+            New-RemoteDirectory -RemotePath $destPath
+        }
+        return $destPath
+    }
+    return $DestinationFolder
+}
+
+function Get-StlMeta {
+    <#
+    .SYNOPSIS
+        Parses a post-generated STL metadata sidecar and gates it on schema and
+        version. Returns $null if the file is not one of ours or is unusable.
+    #>
+    param([string]$Path)
+
+    try { $j = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json }
+    catch { return $null }
+
+    if (-not $j -or $j.schema -ne $StlMetaSchema) { return $null }   # not our sidecar
+
+    if ($null -eq $j.schemaVersion -or [int]$j.schemaVersion -gt $StlMetaMaxSchemaVersion) {
+        Write-Log "STL metadata schemaVersion $($j.schemaVersion) is newer than supported ($StlMetaMaxSchemaVersion): $Path" "ERROR"
+        Write-Log "Refusing to guess. Update the watcher before using this post." "ERROR"
+        return $null
+    }
+    return $j
+}
+
+function Invoke-StlPrep {
+    <#
+    .SYNOPSIS
+        Runs TNCWatcher-StlPrep.exe and returns its JSON report as an object,
+        or $null on failure. Extra arguments are passed through.
+    .OUTPUTS
+        PSCustomObject from the tool's JSON report, plus an ExitCode property.
+    #>
+    param(
+        [string]$InputFile,
+        [string]$OutputFile,
+        [string[]]$ExtraArgs = @()
+    )
+
+    if (-not (Test-Path $StlPrepExe)) {
+        Write-Log "STL prep tool not found at $StlPrepExe - build it with service\Build-StlPrep.cmd" "ERROR"
+        return $null
+    }
+
+    $argList = @("`"$InputFile`"", "`"$OutputFile`"") + $ExtraArgs
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = $StlPrepExe
+    $psi.Arguments              = ($argList -join " ")
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $out = $p.StandardOutput.ReadToEnd()
+        $err = $p.StandardError.ReadToEnd()
+        $p.WaitForExit()
+        $code = $p.ExitCode
+        $p.Dispose()
+
+        if ($code -ne 0) {
+            Write-Log "STL prep failed (exit $code) for $([System.IO.Path]::GetFileName($InputFile)): $($err.Trim())" "ERROR"
+            return $null
+        }
+        $rep = $out.Trim() | ConvertFrom-Json
+        return $rep
+    }
+    catch {
+        Write-Log "STL prep exception for $([System.IO.Path]::GetFileName($InputFile)): $_" "ERROR"
+        return $null
+    }
+}
+
+function Test-StlFrameHypothesis {
+    <#
+    .SYNOPSIS
+        The post documents the STL vertex frame as inferred-unverified. Compare
+        the STOCK mesh's actual bounds against stockBounds_wcs from the JSON. If
+        they disagree, the fixture would be placed in the wrong frame, so the
+        caller must not upload it.
+    .OUTPUTS
+        $true if the frame checks out (or cannot be checked), $false on mismatch.
+    #>
+    param(
+        [string]$StockFile,
+        $Meta
+    )
+
+    if (-not $StlValidateStockBounds) { return $true }
+    if (-not $Meta.stockBounds_wcs -or -not (Test-Path $StockFile)) { return $true }
+
+    $rep = Invoke-StlPrep -InputFile $StockFile -OutputFile "$StockFile.probe" -ExtraArgs @("--probe")
+    if (-not $rep) { return $true }   # already logged; don't block on a probe failure
+
+    # stockBounds_wcs is in NC units; the mesh is in frames.stlUnits.
+    $stlUnits = if ($Meta.frames -and $Meta.frames.stlUnits) { [string]$Meta.frames.stlUnits } else { "mm" }
+    $lo = $Meta.stockBounds_wcs.lower
+    $hi = $Meta.stockBounds_wcs.upper
+    $k = 1.0
+    if ($lo.units -and ([string]$lo.units) -ne $stlUnits) {
+        $k = if ($stlUnits -eq "mm") { 25.4 } else { 1.0 / 25.4 }
+    }
+
+    $tol = if ($stlUnits -eq "mm") { $StlBoundsToleranceMM } else { $StlBoundsToleranceMM / 25.4 }
+    # Parenthesise every element: PowerShell's comma binds tighter than '*',
+    # so an unparenthesised list would try to multiply an array.
+    $want = @(([double]$lo.x * $k), ([double]$lo.y * $k), ([double]$lo.z * $k),
+              ([double]$hi.x * $k), ([double]$hi.y * $k), ([double]$hi.z * $k))
+    $got = $rep.bboxIn
+
+    $worst = 0.0
+    for ($i = 0; $i -lt 6; $i++) {
+        $d = [Math]::Abs([double]$got[$i] - $want[$i])
+        if ($d -gt $worst) { $worst = $d }
+    }
+
+    if ($worst -le $tol) {
+        Write-Log "STL frame check OK (stock bounds match within $([Math]::Round($worst,4)) $stlUnits)" "DEBUG"
+        return $true
+    }
+
+    Write-Log "STL FRAME CHECK FAILED: stock mesh bounds differ from stockBounds_wcs by $([Math]::Round($worst,4)) $stlUnits (tolerance $tol)" "ERROR"
+    Write-Log "  mesh:     $($got -join ', ')" "ERROR"
+    Write-Log "  expected: $($want -join ', ')" "ERROR"
+    Write-Log "  The fixture would be placed in the wrong frame - FIXTURE UPLOAD SKIPPED." "ERROR"
+    Write-Log "  See Fixture-STL-Handoff.md section 6 to resolve the frame hypothesis." "ERROR"
+    return $false
+}
+
+function Send-StlBundle {
+    <#
+    .SYNOPSIS
+        Processes and uploads the STL meshes described by a post metadata
+        sidecar. Called after the program itself has been sent, so the meshes
+        always arrive after the program they belong to.
+
+        STOCK/PART are decimated only. FIXTURE is additionally re-origined about
+        the attach point (the control places it by putting the mesh origin on
+        its own attach location) and shrunk for DCM clearance.
+    #>
+    param(
+        [string]$MetaFile,
+        [string]$RemotePath
+    )
+
+    $meta = Get-StlMeta -Path $MetaFile
+    if (-not $meta) { return }
+
+    $folder = [System.IO.Path]::GetDirectoryName($MetaFile)
+
+    Write-Log ""
+    Write-Log "STL bundle detected: $([System.IO.Path]::GetFileName($MetaFile))"
+    if ($meta.program -and $meta.program.fileStem) { Write-Log "  program stem:  $($meta.program.fileStem)" }
+    if ($meta.generated -and $meta.generated.post) { Write-Log "  post:          $($meta.generated.post)" }
+
+    # Surface every warning the post raised - never swallow these.
+    if ($meta.warnings) {
+        foreach ($w in $meta.warnings) { Write-Log "  POST WARNING: $w" "WARNING" }
+    }
+    if ($meta.wcs -and $meta.wcs.workOffsetsUsed -and @($meta.wcs.workOffsetsUsed).Count -gt 1) {
+        Write-Log "  Multi-WCS program (offsets: $(@($meta.wcs.workOffsetsUsed) -join ', ')); attach point taken from the first section." "WARNING"
+    }
+
+    $stlUnits = if ($meta.frames -and $meta.frames.stlUnits) { [string]$meta.frames.stlUnits } else { "mm" }
+    if ($meta.frames -and -not $meta.frames.camDocumentUnits) {
+        Write-Log "  CAM document unit undetermined; STL unit fell back to the NC unit. Verify before relying on this." "WARNING"
+    }
+
+    # Which meshes actually exist? Only act on written:true.
+    $exports = @()
+    if ($meta.exports) { $exports = @($meta.exports | Where-Object { $_.written -eq $true }) }
+    if ($exports.Count -eq 0) {
+        Write-Log "  No meshes were written (CLI post or nothing to export) - nothing to upload."
+        return
+    }
+
+    # Frame sanity: validate against the STOCK mesh before trusting the fixture.
+    $fixtureOk = $true
+    $stockRec = $exports | Where-Object { $_.role -eq "STOCK" } | Select-Object -First 1
+    if ($stockRec) {
+        $stockPath = Join-Path $folder $stockRec.file
+        $fixtureOk = Test-StlFrameHypothesis -StockFile $stockPath -Meta $meta
+    }
+
+    $tempDir = Join-Path $env:TEMP ("TNCWatcher-stl\" + [System.Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tempDir -Force -ErrorAction SilentlyContinue | Out-Null
+
+    try {
+        # Fixture last: it is the one that can be skipped, and STOCK/PART are
+        # cheap. Order among the meshes is not otherwise significant.
+        $order = @("STOCK", "PART", "FIXTURE")
+        foreach ($role in $order) {
+            $rec = $exports | Where-Object { $_.role -eq $role } | Select-Object -First 1
+            if (-not $rec) { continue }
+
+            $src = Join-Path $folder $rec.file
+            if (-not (Test-Path $src)) {
+                Write-Log "  $role listed as written but missing on disk: $($rec.file)" "WARNING"
+                continue
+            }
+
+            $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits)
+
+            if ($role -eq "FIXTURE") {
+                if (-not $fixtureOk) {
+                    Write-Log "  FIXTURE skipped: frame check failed (see above)." "ERROR"
+                    continue
+                }
+                $A = $meta.fixtureAttachPoint_inFixtureFrame_stlUnits
+                if (-not $A -or $null -eq $A.x -or $null -eq $A.y -or $null -eq $A.z) {
+                    Write-Log "  FIXTURE skipped: no attach point in the metadata (no machine model / simulation placement in the Setup)." "ERROR"
+                    Write-Log "  Never guess this - a wrong datum drives the fixture into the table in simulation." "ERROR"
+                    continue
+                }
+                $attachArg = ("{0},{1},{2}" -f [double]$A.x, [double]$A.y, [double]$A.z)
+                $prepArgs += @("--attach", $attachArg, "--clearance", "$FixtureClearanceMM")
+                Write-Log "  FIXTURE attach point ($stlUnits): $attachArg -> re-origined to 0,0,0"
+            }
+
+            $prepped = Join-Path $tempDir $rec.file
+            $rep = Invoke-StlPrep -InputFile $src -OutputFile $prepped -ExtraArgs $prepArgs
+            if (-not $rep) { continue }
+
+            foreach ($w in @($rep.warnings)) { if ($w) { Write-Log "  STL PREP: $w" "WARNING" } }
+            Write-Log ("  {0}: {1} -> {2} triangles (deviation {3} {4}){5}" -f `
+                $role, $rep.trianglesIn, $rep.trianglesOut, $rep.maxDeviation, $stlUnits,
+                $(if ($rep.scaled) { ", shrunk ${FixtureClearanceMM}mm/face" } else { "" }))
+
+            $result = Send-FileToMachine -SourceFile $prepped -DestinationPath $RemotePath
+            if ($result.Success) { Write-Log "  $role uploaded: $($rec.file)" "SUCCESS" }
+            else { Write-Log "  $role upload FAILED: $($rec.file)" "ERROR" }
+        }
+        # Retire the sidecar and the source meshes. Without this the fallback
+        # rescan would find them again every few minutes and re-upload the whole
+        # set forever.
+        foreach ($rec in $exports) {
+            $src = Join-Path $folder $rec.file
+            if (Test-Path $src) { Move-ProcessedFile -FilePath $src -Success $true }
+        }
+        Move-ProcessedFile -FilePath $MetaFile -Success $true
+    }
+    finally {
+        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $folder "*.probe") -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Find-StlMetaFor {
+    <#
+    .SYNOPSIS
+        Finds the STL metadata sidecar that belongs to a given NC file, in the
+        same folder. Handles both post layouts: bare FIXTURE.json (per-program
+        subfolder) and <stem>_FIXTURE.json (flat).
+    #>
+    param([string]$NcFilePath)
+
+    $dir = [System.IO.Path]::GetDirectoryName($NcFilePath)
+    $ncName = [System.IO.Path]::GetFileName($NcFilePath)
+
+    foreach ($cand in @(Get-ChildItem -Path $dir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+        $m = Get-StlMeta -Path $cand.FullName
+        if (-not $m) { continue }
+        if ($m.program -and $m.program.ncFile -and ([string]$m.program.ncFile -ieq $ncName)) { return $cand.FullName }
+    }
+    return $null
+}
+
 function Process-SingleFile {
     <#
     .SYNOPSIS
@@ -1203,6 +1518,12 @@ function Process-SingleFile {
         return
     }
     
+    # Meshes are never uploaded on their own - they go with their program via
+    # Send-StlBundle. Returning before the readiness log keeps them out of the
+    # log entirely; the prep tool re-checks completeness exactly when it reads
+    # them (a binary STL's size must equal 84 + 50*triangleCount).
+    if ($EnableStlTransfer -and ([System.IO.Path]::GetExtension($fileName) -ieq ".stl")) { return }
+
     # Wait for file to be fully written
     Write-Log "Waiting for file to be ready: $fileName"
     $ready = Wait-FileReady -FilePath $FilePath -TimeoutSeconds 30
@@ -1212,6 +1533,38 @@ function Process-SingleFile {
         return
     }
     
+    # ---- STL bundle companions -------------------------------------------
+    # .stl and the post's .json sidecar are never uploaded on their own. They
+    # belong to a program and are handled by Send-StlBundle, which runs AFTER
+    # that program transfers so the meshes always follow it.
+    #
+    # The post writes them in a different order depending on its layout:
+    #   subfolder layout (default): STLs -> JSON -> NC file (NC last)
+    #   flat layout:                NC file -> STLs -> JSON (JSON last)
+    # so neither file is a universal "everything is here" signal. Both are used
+    # as triggers instead: whichever of (program, sidecar) completes last kicks
+    # off the upload, and the program is only sent once.
+    $ext = [System.IO.Path]::GetExtension($fileName)
+
+    if ($EnableStlTransfer -and $ext -ieq ".json") {
+        $meta = Get-StlMeta -Path $FilePath
+        if (-not $meta) { return }     # someone else's json - ignore, never upload
+
+        # If the NC file is still sitting here, it has not transferred yet; the
+        # program's own completion will trigger the bundle. Otherwise it already
+        # went (flat layout), so send the meshes now.
+        $ncName = if ($meta.program) { [string]$meta.program.ncFile } else { $null }
+        $ncPath = if ($ncName) { Join-Path ([System.IO.Path]::GetDirectoryName($FilePath)) $ncName } else { $null }
+        if ($ncPath -and (Test-Path $ncPath)) {
+            Write-Log "STL sidecar staged; waiting for its program to transfer first: $ncName" "DEBUG"
+            return
+        }
+
+        $remote = Get-RemoteDestinationFor -FilePath $FilePath
+        Send-StlBundle -MetaFile $FilePath -RemotePath $remote
+        return
+    }
+
     # Check if this is a tool table needing special routing: either the filename
     # matches $ToolTableFiles, or it was dropped in the tool table folder (but
     # not in that folder's Backups subfolder).
@@ -1230,22 +1583,18 @@ function Process-SingleFile {
     }
 
     # Compute destination path, preserving subfolder structure
-    $watchBase = $WatchFolder.TrimEnd('\', '/')
-    $relativePath = $FilePath.Substring($watchBase.Length + 1)
-    $relativeDir = [System.IO.Path]::GetDirectoryName($relativePath)
-    
-    if ($relativeDir) {
-        # File is in a subfolder - mirror the structure on the CNC
-        $destPath = $DestinationFolder.TrimEnd('\', '/') + '\' + $relativeDir.Replace('/', '\')
-        Write-Log "Creating remote directory: $destPath"
-        New-RemoteDirectory -RemotePath $destPath
-    } else {
-        $destPath = $DestinationFolder
-    }
-    
+    $destPath = Get-RemoteDestinationFor -FilePath $FilePath -CreateRemote $true
+
     # Transfer the file
     $result = Send-FileToMachine -SourceFile $FilePath -DestinationPath $destPath
-    
+
+    # A program with an STL sidecar beside it: now that the program itself has
+    # landed, send its meshes so they arrive after it.
+    if ($EnableStlTransfer -and $result.Success) {
+        $meta = Find-StlMetaFor -NcFilePath $FilePath
+        if ($meta) { Send-StlBundle -MetaFile $meta -RemotePath $destPath }
+    }
+
     # Handle post-transfer file movement
     Move-ProcessedFile -FilePath $FilePath -Success $result.Success
 }

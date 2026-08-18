@@ -9,11 +9,17 @@
 //   3. Decimates to a triangle budget (default 19500, under the control's
 //      20000 limit) using quadric error metric edge collapse
 //      (Garland-Heckbert), which preserves shape far better than clustering.
-//   4. Optionally shrinks the mesh about a fixed attach point so every face
-//      moves inward by a set clearance - used to keep DCM from tripping on
-//      fixtures. The attach point stays exactly put, so the fixture remains
-//      registered to machine coordinates.
-//   5. Writes a binary STL and prints a JSON report to stdout.
+//   4. For a FIXTURE, re-origins the mesh about the attach point supplied by
+//      the post (v' = v - A). The control places a fixture by putting the
+//      mesh's (0,0,0) onto its own fixture attach location, so this is
+//      required, not cosmetic. Pure translation - no rotation, no mirroring.
+//   5. Optionally shrinks the mesh about that (now origin) attach point so
+//      every face moves inward by a set clearance, keeping DCM from tripping.
+//      Geometry below the attach plane keeps its Z: pullstuds and bolt heads
+//      have to stay where the machine expects them.
+//   6. Writes a binary STL and prints a JSON report to stdout.
+//
+// Stock and part meshes get decimation ONLY - never re-origined, never scaled.
 //
 // Build with service\Build-StlPrep.cmd (in-box C# compiler, no SDK needed).
 // C# 5 syntax only - no string interpolation, tuples, or out-var.
@@ -638,6 +644,9 @@ static class Program
         bool autoAttach = false;
         Vec3 attach = new Vec3(0, 0, 0);
         bool quiet = false;
+        bool translate = true;      // --attach re-origins the mesh (see below)
+        bool probe = false;
+        string stlUnits = "mm";
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -655,6 +664,13 @@ static class Program
                                   double.Parse(p[2], CultureInfo.InvariantCulture));
                 haveAttach = true;
             }
+            else if (a == "--stl-units" && i + 1 < args.Length)
+            {
+                stlUnits = args[++i].ToLowerInvariant();
+                if (stlUnits != "mm" && stlUnits != "in") { Console.Error.WriteLine("--stl-units must be mm or in"); return 1; }
+            }
+            else if (a == "--no-translate") translate = false;
+            else if (a == "--probe") probe = true;
             else if (a == "--quiet") quiet = true;
             else { Console.Error.WriteLine("Unknown option: " + a); Usage(); return 1; }
         }
@@ -668,6 +684,42 @@ static class Program
 
         Vec3 minIn, maxIn;
         mesh.Bounds(out minIn, out maxIn);
+
+        // --probe: report the AS-READ bounds and stop. Used to check the STL
+        // vertex frame against stockBounds_wcs in the post's JSON before any
+        // fixture is trusted (that frame is documented as inferred-unverified).
+        if (probe)
+        {
+            StringBuilder pb = new StringBuilder();
+            pb.Append("{\"ok\":true,\"probe\":true");
+            pb.Append(",\"trianglesIn\":").Append(trisIn);
+            pb.Append(",\"bboxIn\":[").Append(F(minIn.X)).Append(",").Append(F(minIn.Y)).Append(",").Append(F(minIn.Z)).Append(",")
+                                     .Append(F(maxIn.X)).Append(",").Append(F(maxIn.Y)).Append(",").Append(F(maxIn.Z)).Append("]}");
+            Console.WriteLine(pb.ToString());
+            return 0;
+        }
+
+        // The control places a fixture by putting the mesh's (0,0,0) onto its
+        // fixture attach location, so the mesh must be re-origined about the
+        // attach point: v' = v - A. Pure translation, no rotation or scaling.
+        // Afterwards the attach point IS the origin, so the clearance scale
+        // below simply anchors at (0,0,0).
+        bool translated = false;
+        if (haveAttach && translate)
+        {
+            for (int i = 0; i < mesh.Verts.Count; i++)
+            {
+                Vec3 v = mesh.Verts[i];
+                mesh.Verts[i] = new Vec3(v.X - attach.X, v.Y - attach.Y, v.Z - attach.Z);
+            }
+            attach = new Vec3(0, 0, 0);
+            translated = true;
+        }
+
+        // Clearance is always given in mm; convert if the mesh is in inches.
+        // (frames.stlUnits in the post's JSON is the CAM document unit, which
+        // is NOT always the NC unit.)
+        double clearMesh = (stlUnits == "in") ? clearance / 25.4 : clearance;
 
         // Weld tolerance scaled to the model so it works for tiny and huge parts.
         Mesh soup = mesh;
@@ -708,7 +760,7 @@ static class Program
         int vertsBelowAnchor = 0;
         bool scaled = false;
         List<string> warn = new List<string>();
-        if (clearance > 0)
+        if (clearMesh > 0)
         {
             Vec3 mn, mx;
             mesh.Bounds(out mn, out mx);
@@ -731,12 +783,12 @@ static class Program
                     warn.Add("attach point GUESSED as bounding-box bottom centre; verify it matches the machine simulation attach");
                 }
 
-                sx = AxisScale(attach.X, mn.X, mx.X, clearance, "X", warn);
-                sy = AxisScale(attach.Y, mn.Y, mx.Y, clearance, "Y", warn);
+                sx = AxisScale(attach.X, mn.X, mx.X, clearMesh, "X", warn);
+                sy = AxisScale(attach.Y, mn.Y, mx.Y, clearMesh, "Y", warn);
 
                 double up = mx.Z - attach.Z;
-                if (up <= clearance) warn.Add("Z: height above attach point (" + F(up) + ") <= clearance; Z left unscaled");
-                else sz = 1.0 - clearance / up;
+                if (up <= clearMesh) warn.Add("Z: height above attach point (" + F(up) + ") <= clearance; Z left unscaled");
+                else sz = 1.0 - clearMesh / up;
 
                 // Geometry below the attach plane is the machine mount interface
                 // (pullstuds, bolt heads, pallet skirt). Its Z is left EXACTLY as
@@ -779,6 +831,9 @@ static class Program
             sb.Append(",\"coarsePasses\":").Append(coarsePasses);
             sb.Append(",\"decimated\":").Append(decimated ? "true" : "false");
             sb.Append(",\"maxDeviation\":").Append(F(deviation));
+            sb.Append(",\"translated\":").Append(translated ? "true" : "false");
+            sb.Append(",\"stlUnits\":\"").Append(stlUnits).Append("\"");
+            sb.Append(",\"clearanceApplied\":").Append(F(scaled ? clearMesh : 0));
             sb.Append(",\"scaled\":").Append(scaled ? "true" : "false");
             sb.Append(",\"vertsBelowAnchor\":").Append(vertsBelowAnchor);
             sb.Append(",\"scale\":[").Append(F(sx)).Append(",").Append(F(sy)).Append(",").Append(F(sz)).Append("]");
@@ -854,8 +909,14 @@ static class Program
         Console.Error.WriteLine("Usage: TNCWatcher-StlPrep.exe <input.stl> <output.stl> [options]");
         Console.Error.WriteLine("  --max-tris N     triangle budget (default 19500, 0 = no decimation)");
         Console.Error.WriteLine("  --clearance MM   shrink each face inward by MM (default 0 = no scaling)");
-        Console.Error.WriteLine("  --attach x,y,z   scale anchor from the machine simulation fixture attach");
+        Console.Error.WriteLine("  --attach x,y,z   fixture attach point, in the INPUT mesh's coordinates.");
+        Console.Error.WriteLine("                   Mesh is re-origined so this lands at (0,0,0), which is");
+        Console.Error.WriteLine("                   where the control expects it, and scaling anchors there.");
         Console.Error.WriteLine("  --attach auto    accept a bounding-box bottom-centre guess (unsafe if asymmetric)");
+        Console.Error.WriteLine("  --no-translate   keep the mesh where it is; only anchor scaling at --attach");
+        Console.Error.WriteLine("  --stl-units U    mm|in - unit of the mesh vertices (default mm). --clearance");
+        Console.Error.WriteLine("                   is always mm and is converted to match.");
+        Console.Error.WriteLine("  --probe          report as-read bounds only; write nothing");
         Console.Error.WriteLine("  --quiet          suppress the JSON report");
     }
 }
