@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.6.1
+  Version: 1.7.0
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -1936,7 +1936,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.6.1"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.7.0"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
