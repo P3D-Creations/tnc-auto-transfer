@@ -233,6 +233,70 @@ static class Shells
     static void Union(int[] p, int a, int b) { int ra = Find(p, a), rb = Find(p, b); if (ra != rb) p[rb] = ra; }
 }
 
+// ---------------------------------------------------------------------------
+
+// Watertightness / manifold check. The control needs a closed mesh, so this
+// runs on the way in and again on the way out: it says whether the incoming
+// export was already broken, and whether processing made anything worse.
+//
+//   boundary edges  - edges with a single face: actual holes
+//   non-manifold    - edges with more than two faces: shells touching, or
+//                     faces stacked on top of one another
+static class Topo
+{
+    public class Report
+    {
+        public int Boundary, NonManifold, Degenerate, Triangles;
+        // Watertight/closed means no boundary edges: the surface bounds a
+        // volume. Non-manifold edges are a separate, lesser condition - two
+        // shells meeting along a seam is still closed, and Fusion exports
+        // arrive that way - so they are reported but do not clear this flag.
+        public bool Closed { get { return Boundary == 0 && Degenerate == 0; } }
+        public bool Manifold { get { return NonManifold == 0; } }
+        public string Json()
+        {
+            return "{\"closed\":" + (Closed ? "true" : "false") +
+                   ",\"manifold\":" + (Manifold ? "true" : "false") +
+                   ",\"holes\":" + Boundary +
+                   ",\"nonManifold\":" + NonManifold +
+                   ",\"degenerate\":" + Degenerate + "}";
+        }
+        public string Text()
+        {
+            if (Closed && Manifold) return "watertight and manifold";
+            if (Closed) return "closed (watertight), " + NonManifold + " non-manifold edge(s)";
+            return "NOT closed - " + Boundary + " hole edge(s), " + NonManifold +
+                   " non-manifold, " + Degenerate + " degenerate";
+        }
+    }
+
+    public static Report Check(Mesh m)
+    {
+        Report r = new Report();
+        r.Triangles = m.TriangleCount;
+        Dictionary<long, int> edge = new Dictionary<long, int>();
+        for (int t = 0; t < m.Tris.Count; t += 3)
+        {
+            int a = m.Tris[t], b = m.Tris[t + 1], c = m.Tris[t + 2];
+            if (a == b || b == c || a == c) { r.Degenerate++; continue; }
+            Bump(edge, a, b); Bump(edge, b, c); Bump(edge, c, a);
+        }
+        foreach (KeyValuePair<long, int> kv in edge)
+        {
+            if (kv.Value == 1) r.Boundary++;
+            else if (kv.Value > 2) r.NonManifold++;
+        }
+        return r;
+    }
+
+    static void Bump(Dictionary<long, int> d, int a, int b)
+    {
+        int lo = Math.Min(a, b), hi = Math.Max(a, b);
+        long k = ((long)lo << 32) | (uint)hi;
+        int v; d.TryGetValue(k, out v); d[k] = v + 1;
+    }
+}
+
 class Mesh
 {
     public List<Vec3> Verts = new List<Vec3>();
@@ -412,11 +476,35 @@ static class StlIO
 
 // ---------------------------------------------------------------------------
 
+// Exact identity of a triangle regardless of winding. A plain hash is not
+// enough here: a collision would discard a genuine triangle and tear a hole in
+// the mesh.
+struct TriKey : IEquatable<TriKey>
+{
+    readonly int a, b, c;
+    public TriKey(int x, int y, int z)
+    {
+        int t;
+        if (x > y) { t = x; x = y; y = t; }
+        if (y > z) { t = y; y = z; z = t; }
+        if (x > y) { t = x; x = y; y = t; }
+        a = x; b = y; c = z;
+    }
+    public bool Equals(TriKey o) { return a == o.a && b == o.b && c == o.c; }
+    public override bool Equals(object o) { return o is TriKey && Equals((TriKey)o); }
+    public override int GetHashCode()
+    {
+        unchecked { int h = a; h = h * 397 ^ b; h = h * 397 ^ c; return h; }
+    }
+}
+
 static class Weld
 {
     // STL is a triangle soup: every triangle carries its own copy of each
     // corner. Edge collapse needs shared vertices, so merge coincident ones.
-    public static Mesh Run(Mesh src, double tol)
+    public static Mesh Run(Mesh src, double tol) { return Run(src, tol, false); }
+
+    public static Mesh Run(Mesh src, double tol, bool dedupe)
     {
         Mesh m = new Mesh();
         Dictionary<long, List<int>> buckets = new Dictionary<long, List<int>>();
@@ -460,10 +548,18 @@ static class Weld
             remap[i] = found;
         }
 
+        // Drop degenerate AND duplicate triangles. Welding at a coarse tolerance
+        // merges distinct vertices, which stacks several triangles onto the same
+        // corners; left alone those pile up into edges carrying 4, 6, 18 faces
+        // and destroy watertightness.
+        HashSet<TriKey> seenTri = dedupe ? new HashSet<TriKey>() : null;
         for (int t = 0; t < src.Tris.Count; t += 3)
         {
             int a = remap[src.Tris[t]], b = remap[src.Tris[t + 1]], c = remap[src.Tris[t + 2]];
             if (a == b || b == c || a == c) continue;   // collapsed to nothing
+
+            if (dedupe && !seenTri.Add(new TriKey(a, b, c))) continue;   // same three corners already present
+
             m.Tris.Add(a); m.Tris.Add(b); m.Tris.Add(c);
         }
         return m;
@@ -532,6 +628,7 @@ class Decimator
             Evaluate(c.A, c.B, out p, out cost);
             if (cost > c.Cost * 1.0001 + 1e-12) { Push(new Cand { Cost = cost, A = c.A, B = c.B, P = p }); continue; }
 
+            if (!LinkConditionOk(c.A, c.B)) continue;
             if (WouldFlip(c.A, c.B, p)) continue;
 
             double dev = Math.Sqrt(Math.Max(0, cost));
@@ -696,6 +793,45 @@ class Decimator
         return false;
     }
 
+
+    // Link condition. Collapsing an edge is only topology-safe when the one-ring
+    // neighbourhoods of its two endpoints meet in exactly the vertices opposite
+    // that edge - two for an interior edge, one on a boundary. Any extra shared
+    // neighbour means the collapse would weld two surface sheets together and
+    // produce a non-manifold edge or a hole. Checking for a flipped normal, as
+    // WouldFlip does, does not catch this.
+    readonly HashSet<int> ringA = new HashSet<int>();
+    readonly HashSet<int> ringSeen = new HashSet<int>();
+
+    bool LinkConditionOk(int a, int b)
+    {
+        int sharedFaces = 0;
+        ringA.Clear();
+        foreach (int f in vTris[a])
+        {
+            if (tDead[f]) continue;
+            int i0 = tri[f * 3], i1 = tri[f * 3 + 1], i2 = tri[f * 3 + 2];
+            if (i0 == b || i1 == b || i2 == b) sharedFaces++;
+            if (i0 != a) ringA.Add(i0);
+            if (i1 != a) ringA.Add(i1);
+            if (i2 != a) ringA.Add(i2);
+        }
+
+        int common = 0;
+        ringSeen.Clear();
+        foreach (int f in vTris[b])
+        {
+            if (tDead[f]) continue;
+            for (int k = 0; k < 3; k++)
+            {
+                int v = tri[f * 3 + k];
+                if (v == b || v == a) continue;
+                if (ringA.Contains(v) && ringSeen.Add(v)) common++;
+            }
+        }
+        return common == sharedFaces;
+    }
+
     // Reject a collapse that would fold a triangle over on itself.
     bool WouldFlip(int a, int b, Vec3 p)
     {
@@ -849,6 +985,7 @@ static class Program
         bool ascii = false;
         string progressFile = null;
         double coarse = 0.10;
+        int topoCheckLimit = 400000;
         double speckFraction = 0.01;   // drop shells smaller than this fraction of the model diagonal
         bool pruneShells = true;
         bool preserveExtents = true;   // fraction of the coarse target edge used as the starting weld tolerance; 0 disables
@@ -881,6 +1018,7 @@ static class Program
             else if (a == "--progress-file" && i + 1 < args.Length) progressFile = args[++i];
             else if (a == "--coarse" && i + 1 < args.Length) coarse = double.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--no-prune") pruneShells = false;
+            else if (a == "--topo-limit" && i + 1 < args.Length) topoCheckLimit = int.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--speck" && i + 1 < args.Length) speckFraction = double.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--no-preserve-extents") preserveExtents = false;
             else if (a == "--quiet") quiet = true;
@@ -949,6 +1087,12 @@ static class Program
         // pass. Only engages far above the target, and the tolerance is capped
         // at 0.1% of the bounding diagonal so the loss stays far below the
         // clearance we are about to apply.
+        // Checking a 1.6M-triangle input costs real time and memory for a
+        // description of a mesh we are about to replace, so it is skipped above
+        // this size; the OUTPUT check always runs and is what the control sees.
+        Topo.Report topoIn = (mesh.TriangleCount <= topoCheckLimit)
+            ? Topo.Check(mesh) : null;
+
         // Throw away geometry that cannot matter before spending any budget on
         // it: sealed internal voids and stray specks.
         int speckShells = 0, voidShells = 0;
@@ -976,14 +1120,14 @@ static class Program
             double cap = diag * 5e-3;
             weldTol = Math.Max(weldTol, Math.Min(targetEdge * coarse, cap));
             Prog.SetNow("coarse weld (" + mesh.TriangleCount + " triangles)");
-            mesh = Weld.Run(soup, weldTol);
+            mesh = Weld.Run(soup, weldTol, true);
             coarsePasses = 1;
 
             while (mesh.TriangleCount > coarseTarget && weldTol < cap && coarsePasses < 6)
             {
                 weldTol = Math.Min(weldTol * 2.0, cap);
                 Prog.SetNow("coarse weld pass " + (coarsePasses + 1));
-                mesh = Weld.Run(soup, weldTol);
+                mesh = Weld.Run(soup, weldTol, true);
                 coarsePasses++;
             }
         }
@@ -1000,11 +1144,33 @@ static class Program
             decimated = true;
         }
 
+        // Topology after reduction. Scaling below is affine and cannot change
+        // connectivity, so this is the final topology.
+        Topo.Report topoOut = Topo.Check(mesh);
+
         // ---- shrink about the attach point ----
         double sx = 1, sy = 1, sz = 1;
         int vertsBelowAnchor = 0;
         bool scaled = false;
         List<string> warn = new List<string>();
+        if (topoIn != null && !topoIn.Closed)
+        {
+            warn.Add("input mesh is " + topoIn.Text() + " - the control expects a closed mesh; fix the export if it is rejected");
+        }
+        else if (topoIn != null && !topoIn.Manifold)
+        {
+            warn.Add("input mesh is " + topoIn.Text() + " (closed, so usable, but the seams come from the export)");
+        }
+        if (topoIn != null && (topoOut.NonManifold > topoIn.NonManifold || topoOut.Boundary > topoIn.Boundary))
+        {
+            warn.Add("processing degraded topology: in=" + topoIn.Text() + ", out=" + topoOut.Text());
+        }
+        if (!topoOut.Closed)
+        {
+            warn.Add("output mesh is " + topoOut.Text() + " - the control expects a closed mesh." +
+                     " Re-run with --coarse 0 to keep it closed (much slower on dense meshes).");
+        }
+
         if (clearMesh > 0)
         {
             Vec3 mn, mx;
@@ -1076,6 +1242,8 @@ static class Program
             sb.Append(",\"weldTol\":").Append(F(weldTol));
             sb.Append(",\"coarsePasses\":").Append(coarsePasses);
             sb.Append(",\"coarse\":").Append(F(coarse));
+            sb.Append(",\"topologyIn\":").Append(topoIn == null ? "null" : topoIn.Json());
+            sb.Append(",\"topologyOut\":").Append(topoOut.Json());
             sb.Append(",\"speckShells\":").Append(speckShells);
             sb.Append(",\"voidShells\":").Append(voidShells);
             sb.Append(",\"decimated\":").Append(decimated ? "true" : "false");

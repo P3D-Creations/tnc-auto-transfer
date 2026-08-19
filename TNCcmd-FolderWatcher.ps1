@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.8.0
+  Version: 1.8.1
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -196,6 +196,22 @@ $StlAsciiOutput    = $true
 # others still go.
 $StlPrepTimeoutSeconds = 600
 
+# Coarse pre-weld aggressiveness for very dense meshes (fraction of the target
+# edge length). This is a correctness/speed dial, so it is worth knowing what
+# it costs. Measured on a 1.66M-triangle in-process stock mesh:
+#
+#   0.10 (default)  ~5s      creates ~2700 holes - NOT closed
+#   0               ~38min   stays closed, 0 holes, and 3x more accurate
+#
+# The pre-weld is vertex clustering, which cannot preserve closure at this
+# reduction ratio. It only engages above 8x the triangle budget, so fixtures
+# and part meshes never take this path - they are always closed and accurate.
+# Only dense in-process stock is affected, and that is display-only geometry.
+#
+# Set to 0 if the control rejects a torn stock mesh, and raise
+# $StlPrepTimeoutSeconds well above the expected runtime or it will be killed.
+$StlCoarseFactor = 0.10
+
 # How often to echo the converter's current stage to the log while it works.
 $StlProgressIntervalSeconds = 10
 
@@ -323,6 +339,8 @@ if (Test-Path $ConfigFile) {
         if ($cfg.TransferTimeoutSeconds) { $TransferTimeoutSeconds = [int]$cfg.TransferTimeoutSeconds }
         if ($cfg.ToolTableTransferMode)  { $ToolTableTransferMode  = [string]$cfg.ToolTableTransferMode }
         if ($cfg.ToolTableFolder)        { $ToolTableFolder        = [string]$cfg.ToolTableFolder }
+        if ($null -ne $cfg.StlCoarseFactor)       { $StlCoarseFactor       = [double]$cfg.StlCoarseFactor }
+        if ($null -ne $cfg.StlPrepTimeoutSeconds) { $StlPrepTimeoutSeconds = [int]$cfg.StlPrepTimeoutSeconds }
         if ($null -ne $cfg.FixtureClearanceMM)     { $FixtureClearanceMM     = [double]$cfg.FixtureClearanceMM }
         if ($null -ne $cfg.NcSettleDelaySeconds)   { $NcSettleDelaySeconds   = [int]$cfg.NcSettleDelaySeconds }
         if ($null -ne $cfg.StlUseSubfolderSidecarCheck) { $StlUseSubfolderSidecarCheck = [bool]$cfg.StlUseSubfolderSidecarCheck }
@@ -1534,7 +1552,8 @@ function Send-StlBundle {
                 continue
             }
 
-            $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits)
+            $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits,
+                          "--coarse", ([string]$StlCoarseFactor))
             if ($StlAsciiOutput) { $prepArgs += "--ascii" }
 
             if ($role -eq "FIXTURE") {
@@ -1563,6 +1582,12 @@ function Send-StlBundle {
             $rep = Invoke-StlPrep -InputFile $src -OutputFile $prepped -ExtraArgs $prepArgs
             if (-not $rep) { continue }
 
+            if ($rep.topologyOut) {
+                $t = $rep.topologyOut
+                Write-Log ("    {0} topology: {1}, holes {2}, non-manifold {3}" -f `
+                    $role, $(if ($t.closed) { "closed (watertight)" } else { "NOT CLOSED" }), $t.holes, $t.nonManifold) `
+                    $(if ($t.closed) { "DEBUG" } else { "WARNING" })
+            }
             foreach ($w in @($rep.warnings)) { if ($w) { Write-Log "  STL PREP: $w" "WARNING" } }
             Write-Log ("  {0}: {1} -> {2} triangles (deviation {3} {4}){5}" -f `
                 $role, $rep.trianglesIn, $rep.trianglesOut, $rep.maxDeviation, $stlUnits,
@@ -2141,7 +2166,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.8.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.8.1"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
