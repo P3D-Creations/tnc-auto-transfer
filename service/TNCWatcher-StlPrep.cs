@@ -119,6 +119,120 @@ struct Quadric
 
 // ---------------------------------------------------------------------------
 
+// Writes a one-line status to a file so a caller can show signs of life while
+// a very dense mesh is being processed. Overwrites in place, throttled, and
+// never throws - progress reporting must not break the conversion.
+static class Prog
+{
+    static string path;
+    static DateTime last = DateTime.MinValue;
+
+    public static void Init(string p) { path = p; }
+
+    public static void Set(string text) { Write(text, false); }
+    public static void SetNow(string text) { Write(text, true); }
+
+    static void Write(string text, bool force)
+    {
+        if (path == null) return;
+        if (!force && (DateTime.Now - last).TotalMilliseconds < 400) return;
+        last = DateTime.Now;
+        try { File.WriteAllText(path, text); } catch { }
+    }
+}
+
+// Splits a welded mesh into connected components and discards the ones that
+// cannot affect a collision check: sealed internal voids and stray specks.
+//
+// An in-process stock mesh carries a lot of geometry the machine never touches
+// - cavities left by earlier operations, detached slivers from the mesher.
+// Removing them BEFORE decimation spends the triangle budget on the outer
+// surface that actually matters instead of on detail nothing can reach.
+static class Shells
+{
+    public static Mesh Prune(Mesh m, double speckFraction, out int specks, out int voids)
+    {
+        specks = 0; voids = 0;
+        int nv = m.Verts.Count, nt = m.TriangleCount;
+        if (nt == 0) return m;
+
+        int[] parent = new int[nv];
+        for (int i = 0; i < nv; i++) parent[i] = i;
+        for (int t = 0; t < nt; t++)
+        {
+            Union(parent, m.Tris[t * 3], m.Tris[t * 3 + 1]);
+            Union(parent, m.Tris[t * 3 + 1], m.Tris[t * 3 + 2]);
+        }
+
+        Dictionary<int, int> idx = new Dictionary<int, int>();
+        List<List<int>> comps = new List<List<int>>();
+        for (int t = 0; t < nt; t++)
+        {
+            int r = Find(parent, m.Tris[t * 3]);
+            int ci;
+            if (!idx.TryGetValue(r, out ci)) { ci = comps.Count; idx[r] = ci; comps.Add(new List<int>()); }
+            comps[ci].Add(t);
+        }
+        if (comps.Count <= 1) return m;
+
+        int n = comps.Count;
+        Vec3[] lo = new Vec3[n], hi = new Vec3[n];
+        double[] diag = new double[n];
+        for (int c = 0; c < n; c++)
+        {
+            Vec3 mn = new Vec3(double.MaxValue, double.MaxValue, double.MaxValue);
+            Vec3 mx = new Vec3(double.MinValue, double.MinValue, double.MinValue);
+            foreach (int t in comps[c])
+                for (int k = 0; k < 3; k++)
+                {
+                    Vec3 q = m.Verts[m.Tris[t * 3 + k]];
+                    if (q.X < mn.X) mn.X = q.X; if (q.X > mx.X) mx.X = q.X;
+                    if (q.Y < mn.Y) mn.Y = q.Y; if (q.Y > mx.Y) mx.Y = q.Y;
+                    if (q.Z < mn.Z) mn.Z = q.Z; if (q.Z > mx.Z) mx.Z = q.Z;
+                }
+            lo[c] = mn; hi[c] = mx; diag[c] = (mx - mn).Length();
+        }
+
+        Vec3 wmn, wmx; m.Bounds(out wmn, out wmx);
+        double worldDiag = (wmx - wmn).Length();
+
+        bool[] keep = new bool[n];
+        for (int c = 0; c < n; c++) keep[c] = true;
+
+        for (int c = 0; c < n; c++)
+        {
+            if (worldDiag > 0 && diag[c] < worldDiag * speckFraction) { keep[c] = false; specks++; continue; }
+            for (int o = 0; o < n; o++)
+            {
+                if (o == c || diag[o] <= diag[c]) continue;
+                if (lo[c].X > lo[o].X && hi[c].X < hi[o].X &&
+                    lo[c].Y > lo[o].Y && hi[c].Y < hi[o].Y &&
+                    lo[c].Z > lo[o].Z && hi[c].Z < hi[o].Z)
+                { keep[c] = false; voids++; break; }
+            }
+        }
+
+        Mesh outM = new Mesh();
+        int[] remap = new int[nv];
+        for (int i = 0; i < nv; i++) remap[i] = -1;
+        for (int c = 0; c < n; c++)
+        {
+            if (!keep[c]) continue;
+            foreach (int t in comps[c])
+                for (int k = 0; k < 3; k++)
+                {
+                    int vi = m.Tris[t * 3 + k];
+                    if (remap[vi] < 0) { remap[vi] = outM.Verts.Count; outM.Verts.Add(m.Verts[vi]); }
+                    outM.Tris.Add(remap[vi]);
+                }
+        }
+        return outM.TriangleCount > 0 ? outM : m;
+    }
+
+    static int Find(int[] p, int x) { while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; } return x; }
+    static void Union(int[] p, int a, int b) { int ra = Find(p, a), rb = Find(p, b); if (ra != rb) p[rb] = ra; }
+}
+
 class Mesh
 {
     public List<Vec3> Verts = new List<Vec3>();
@@ -377,8 +491,12 @@ class Decimator
 
     List<Cand> heap = new List<Cand>();
 
+    public bool PreserveExtents = true;
+    Vec3 clampLo, clampHi;
+
     public Mesh Run(Mesh src, int target, out double maxDeviation)
     {
+        src.Bounds(out clampLo, out clampHi);
         Build(src);
         maxDeviation = 0;
 
@@ -392,8 +510,17 @@ class Decimator
         }
         Heapify();
 
+        int startTris = liveTris;
+        int spins = 0;
         while (liveTris > target && heap.Count > 0)
         {
+            if ((++spins & 1023) == 0 && startTris > target)
+            {
+                double pct = 100.0 * (startTris - liveTris) / (double)(startTris - target);
+                if (pct > 99.9) pct = 99.9;
+                Prog.Set("decimating " + pct.ToString("0") + "% (" + liveTris + " triangles left)");
+            }
+
             Cand c = Pop();
             if (c == null) break;
             if (vDead[c.A] || vDead[c.B]) continue;
@@ -443,6 +570,34 @@ class Decimator
             quad[tri[t]] = quad[tri[t]] + q;
             quad[tri[t + 1]] = quad[tri[t + 1]] + q;
             quad[tri[t + 2]] = quad[tri[t + 2]] + q;
+        }
+
+        // Pin the outer extents. Vertices sitting on the model's bounding faces
+        // define the silhouette the machine actually interacts with, so give
+        // them a heavy quadric for that face: decimation may slide them along
+        // the face but cannot pull the outside dimensions in.
+        if (PreserveExtents)
+        {
+            Vec3 bmn, bmx;
+            {
+                Mesh tmp = new Mesh();
+                tmp.Verts.AddRange(pos);
+                tmp.Tris.AddRange(tri);
+                tmp.Bounds(out bmn, out bmx);
+            }
+            double span = (bmx - bmn).Length();
+            double eps = Math.Max(1e-9, span * 1e-4);
+            double w = 1e4;
+            for (int i = 0; i < pos.Length; i++)
+            {
+                Vec3 v = pos[i];
+                if (Math.Abs(v.X - bmn.X) < eps) quad[i] = quad[i] + Quadric.FromPlane(1, 0, 0, -bmn.X, w);
+                if (Math.Abs(v.X - bmx.X) < eps) quad[i] = quad[i] + Quadric.FromPlane(1, 0, 0, -bmx.X, w);
+                if (Math.Abs(v.Y - bmn.Y) < eps) quad[i] = quad[i] + Quadric.FromPlane(0, 1, 0, -bmn.Y, w);
+                if (Math.Abs(v.Y - bmx.Y) < eps) quad[i] = quad[i] + Quadric.FromPlane(0, 1, 0, -bmx.Y, w);
+                if (Math.Abs(v.Z - bmn.Z) < eps) quad[i] = quad[i] + Quadric.FromPlane(0, 0, 1, -bmn.Z, w);
+                if (Math.Abs(v.Z - bmx.Z) < eps) quad[i] = quad[i] + Quadric.FromPlane(0, 0, 1, -bmx.Z, w);
+            }
         }
 
         // Constrain open boundaries so the silhouette of an open mesh holds.
@@ -512,6 +667,12 @@ class Decimator
         Vec3 opt;
         if (q.Optimal(out opt))
         {
+            // Never let a collapse push a vertex outside the original extents;
+            // an unconstrained quadric optimum happily does, which inflates the
+            // silhouette.
+            opt.X = Math.Min(Math.Max(opt.X, clampLo.X), clampHi.X);
+            opt.Y = Math.Min(Math.Max(opt.Y, clampLo.Y), clampHi.Y);
+            opt.Z = Math.Min(Math.Max(opt.Z, clampLo.Z), clampHi.Z);
             p = opt; cost = q.Error(opt);
             if (cost < 0) cost = 0;
             return;
@@ -686,6 +847,11 @@ static class Program
         bool translate = true;      // --attach re-origins the mesh (see below)
         bool probe = false;
         bool ascii = false;
+        string progressFile = null;
+        double coarse = 0.10;
+        double speckFraction = 0.01;   // drop shells smaller than this fraction of the model diagonal
+        bool pruneShells = true;
+        bool preserveExtents = true;   // fraction of the coarse target edge used as the starting weld tolerance; 0 disables
         string stlUnits = "mm";
 
         for (int i = 2; i < args.Length; i++)
@@ -712,9 +878,17 @@ static class Program
             else if (a == "--no-translate") translate = false;
             else if (a == "--probe") probe = true;
             else if (a == "--ascii") ascii = true;
+            else if (a == "--progress-file" && i + 1 < args.Length) progressFile = args[++i];
+            else if (a == "--coarse" && i + 1 < args.Length) coarse = double.Parse(args[++i], CultureInfo.InvariantCulture);
+            else if (a == "--no-prune") pruneShells = false;
+            else if (a == "--speck" && i + 1 < args.Length) speckFraction = double.Parse(args[++i], CultureInfo.InvariantCulture);
+            else if (a == "--no-preserve-extents") preserveExtents = false;
             else if (a == "--quiet") quiet = true;
             else { Console.Error.WriteLine("Unknown option: " + a); Usage(); return 1; }
         }
+
+        Prog.Init(progressFile);
+        Prog.SetNow("reading");
 
         Mesh mesh;
         try { mesh = StlIO.Read(input); }
@@ -763,6 +937,7 @@ static class Program
         double clearMesh = (stlUnits == "in") ? clearance / 25.4 : clearance;
 
         // Weld tolerance scaled to the model so it works for tiny and huge parts.
+        Prog.SetNow("welding " + trisIn + " triangles");
         Mesh soup = mesh;
         double diag = (maxIn - minIn).Length();
         double weldTol = Math.Max(1e-6, diag * 1e-7);
@@ -774,13 +949,40 @@ static class Program
         // pass. Only engages far above the target, and the tolerance is capped
         // at 0.1% of the bounding diagonal so the loss stays far below the
         // clearance we are about to apply.
-        int coarsePasses = 0;
-        if (maxTris > 0)
+        // Throw away geometry that cannot matter before spending any budget on
+        // it: sealed internal voids and stray specks.
+        int speckShells = 0, voidShells = 0;
+        if (pruneShells)
         {
-            double cap = diag * 1e-3;
-            while (mesh.TriangleCount > maxTris * 8 && weldTol < cap && coarsePasses < 12)
+            Prog.SetNow("pruning unreachable shells");
+            int beforePrune = mesh.TriangleCount;
+            mesh = Shells.Prune(mesh, speckFraction, out speckShells, out voidShells);
+            if (mesh.TriangleCount != beforePrune) soup = mesh;   // coarse passes re-weld from the pruned mesh
+        }
+
+        int coarsePasses = 0;
+        if (maxTris > 0 && coarse > 0 && mesh.TriangleCount > maxTris * 8)
+        {
+            // Jump straight to an estimated tolerance rather than doubling up
+            // from ~0. Each weld pass is a full pass over the soup, so on a
+            // 1.66M-triangle in-process stock mesh a dozen of them dominates
+            // the whole runtime.
+            //
+            // A mesh of N triangles spanning `diag` has edges of roughly
+            // diag/sqrt(N), so aim at the edge length the coarse target implies
+            // and start a little under it.
+            int coarseTarget = maxTris * 8;
+            double targetEdge = diag / Math.Sqrt((double)coarseTarget);
+            double cap = diag * 5e-3;
+            weldTol = Math.Max(weldTol, Math.Min(targetEdge * coarse, cap));
+            Prog.SetNow("coarse weld (" + mesh.TriangleCount + " triangles)");
+            mesh = Weld.Run(soup, weldTol);
+            coarsePasses = 1;
+
+            while (mesh.TriangleCount > coarseTarget && weldTol < cap && coarsePasses < 6)
             {
                 weldTol = Math.Min(weldTol * 2.0, cap);
+                Prog.SetNow("coarse weld pass " + (coarsePasses + 1));
                 mesh = Weld.Run(soup, weldTol);
                 coarsePasses++;
             }
@@ -791,7 +993,9 @@ static class Program
         bool decimated = false;
         if (maxTris > 0 && mesh.TriangleCount > maxTris)
         {
+            Prog.SetNow("decimating " + mesh.TriangleCount + " -> " + maxTris);
             Decimator d = new Decimator();
+            d.PreserveExtents = preserveExtents;
             mesh = d.Run(mesh, maxTris, out deviation);
             decimated = true;
         }
@@ -855,6 +1059,7 @@ static class Program
             }
         }
 
+        Prog.SetNow("writing " + mesh.TriangleCount + " triangles");
         try { if (ascii) StlIO.WriteAscii(output, mesh); else StlIO.WriteBinary(output, mesh); }
         catch (Exception ex) { Console.Error.WriteLine("WRITE FAILED: " + ex.Message); return 3; }
 
@@ -870,6 +1075,9 @@ static class Program
             sb.Append(",\"vertsWelded\":").Append(vertsWelded);
             sb.Append(",\"weldTol\":").Append(F(weldTol));
             sb.Append(",\"coarsePasses\":").Append(coarsePasses);
+            sb.Append(",\"coarse\":").Append(F(coarse));
+            sb.Append(",\"speckShells\":").Append(speckShells);
+            sb.Append(",\"voidShells\":").Append(voidShells);
             sb.Append(",\"decimated\":").Append(decimated ? "true" : "false");
             sb.Append(",\"maxDeviation\":").Append(F(deviation));
             sb.Append(",\"translated\":").Append(translated ? "true" : "false");
@@ -959,6 +1167,7 @@ static class Program
         Console.Error.WriteLine("  --stl-units U    mm|in - unit of the mesh vertices (default mm). --clearance");
         Console.Error.WriteLine("                   is always mm and is converted to match.");
         Console.Error.WriteLine("  --probe          report as-read bounds only; write nothing");
+        Console.Error.WriteLine("  --progress-file F  write a one-line status to F while working");
         Console.Error.WriteLine("  --ascii          write ASCII STL instead of binary. Required for the TNC 640:");
         Console.Error.WriteLine("                   it rejects long runs of bytes with no line break on PUT.");
         Console.Error.WriteLine("  --quiet          suppress the JSON report");

@@ -29,3 +29,4 @@ service/*
 !service/stl-bundle-make.py
 !service/stl-settle-test.ps1
 !service/stl-timing-test.ps1
+!service/stl-quality.py

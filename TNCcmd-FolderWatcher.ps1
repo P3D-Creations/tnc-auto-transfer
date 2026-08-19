@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.7.2
+  Version: 1.8.0
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -188,6 +188,16 @@ $FixtureClearanceMM = 1.5       # each fixture face moves inward this far, to st
 # transfers reliably. Only set this false if a future control firmware fixes
 # binary PUT.
 $StlAsciiOutput    = $true
+
+# Hard limit on one mesh's processing. File handling is single-threaded, so an
+# unbounded wait here stalls every other transfer. An in-process stock mesh for
+# a later operation can be enormous - 1.66M triangles / 83MB has been seen - so
+# this needs headroom, but not forever. On timeout that mesh is skipped and the
+# others still go.
+$StlPrepTimeoutSeconds = 600
+
+# How often to echo the converter's current stage to the log while it works.
+$StlProgressIntervalSeconds = 10
 
 # The post writes the NC file at the parent level while posting, then moves it
 # into the per-program subfolder in onTerminate(). Without a delay the watcher
@@ -1326,16 +1336,57 @@ function Invoke-StlPrep {
     $psi.RedirectStandardError  = $true
     $psi.CreateNoWindow         = $true
 
+    # Async pipe reads plus a hard timeout - same reasoning as Invoke-TNCcmd.
+    # A synchronous ReadToEnd() before WaitForExit() can deadlock, and an
+    # unbounded WaitForExit() blocks the whole watcher: file processing is
+    # single-threaded, so one enormous mesh would stall every other transfer
+    # indefinitely. On timeout the mesh is skipped and the rest still go.
+    # Sign of life while a dense mesh is converted: the tool writes its current
+    # stage to a progress file, and that is echoed to the log every few seconds
+    # so the tray tooltip and live console show something is happening. A 1.66M
+    # triangle in-process stock mesh is not unusual and takes a while.
+    $progressFile = [System.IO.Path]::GetTempFileName()
+    $psi.Arguments = $psi.Arguments + " --progress-file `"$progressFile`""
+
     try {
         $p = [System.Diagnostics.Process]::Start($psi)
-        $out = $p.StandardOutput.ReadToEnd()
-        $err = $p.StandardError.ReadToEnd()
-        $p.WaitForExit()
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+
+        $name = [System.IO.Path]::GetFileName($InputFile)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $nextBeat = $StlProgressIntervalSeconds
+        $timedOut = $false
+
+        while (-not $p.WaitForExit(500)) {
+            if ($sw.Elapsed.TotalSeconds -ge $StlPrepTimeoutSeconds) { $timedOut = $true; break }
+            if ($sw.Elapsed.TotalSeconds -ge $nextBeat) {
+                $nextBeat += $StlProgressIntervalSeconds
+                $stage = ""
+                try { $stage = (Get-Content -LiteralPath $progressFile -Raw -ErrorAction SilentlyContinue) } catch {}
+                if ($stage) { $stage = $stage.Trim() }
+                if (-not $stage) { $stage = "working" }
+                Write-Log ("    {0}: {1} ({2}s elapsed)" -f $name, $stage, [int]$sw.Elapsed.TotalSeconds)
+            }
+        }
+
+        if ($timedOut) {
+            try { $p.Kill() } catch {}
+            $p.WaitForExit(5000) | Out-Null
+            $p.Dispose()
+            Write-Log "STL prep timed out after ${StlPrepTimeoutSeconds}s and was killed: $name" "ERROR"
+            Write-Log "  The mesh is probably far too dense for this budget. Raise the timeout, or export it more coarsely." "ERROR"
+            return $null
+        }
+
+        $out = ""; $err = ""
+        try { if ($outTask.Wait(5000)) { $out = $outTask.Result } } catch {}
+        try { if ($errTask.Wait(5000)) { $err = $errTask.Result } } catch {}
         $code = $p.ExitCode
         $p.Dispose()
 
         if ($code -ne 0) {
-            Write-Log "STL prep failed (exit $code) for $([System.IO.Path]::GetFileName($InputFile)): $($err.Trim())" "ERROR"
+            Write-Log "STL prep failed (exit $code) for ${name}: $($err.Trim())" "ERROR"
             return $null
         }
         $rep = $out.Trim() | ConvertFrom-Json
@@ -1344,6 +1395,9 @@ function Invoke-StlPrep {
     catch {
         Write-Log "STL prep exception for $([System.IO.Path]::GetFileName($InputFile)): $_" "ERROR"
         return $null
+    }
+    finally {
+        Remove-Item -LiteralPath $progressFile -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -2087,7 +2141,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.7.2"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.8.0"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
