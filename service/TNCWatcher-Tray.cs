@@ -38,6 +38,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -145,6 +146,10 @@ class WatcherConfig
     public int TransferTimeoutSeconds = 600;
     public string ToolTableTransferMode = "Merge";
     public string ToolTableFolder = "ToolTables";
+    public bool EnableStlTransfer = true;
+    public double FixtureClearanceMM = 1.5;
+    public int NcSettleDelaySeconds = 45;
+    public bool StlUseSubfolderSidecarCheck = true;
 
     public static string ConfigPath(string baseDir) { return Path.Combine(baseDir, "TNCWatcher-Config.json"); }
     public static string ScriptPath(string baseDir) { return Path.Combine(baseDir, "TNCcmd-FolderWatcher.ps1"); }
@@ -183,6 +188,10 @@ class WatcherConfig
             TransferTimeoutSeconds = MatchInt(text, "TransferTimeoutSeconds", TransferTimeoutSeconds);
             ToolTableTransferMode  = MatchString(text, "ToolTableTransferMode", ToolTableTransferMode);
             ToolTableFolder        = MatchString(text, "ToolTableFolder", ToolTableFolder);
+            EnableStlTransfer      = MatchBool(text, "EnableStlTransfer", EnableStlTransfer);
+            FixtureClearanceMM     = MatchDouble(text, "FixtureClearanceMM", FixtureClearanceMM);
+            NcSettleDelaySeconds   = MatchInt(text, "NcSettleDelaySeconds", NcSettleDelaySeconds);
+            StlUseSubfolderSidecarCheck = MatchBool(text, "StlUseSubfolderSidecarCheck", StlUseSubfolderSidecarCheck);
         }
         catch { }
     }
@@ -197,6 +206,14 @@ class WatcherConfig
     {
         Match m = Regex.Match(text, @"^\s*\$" + name + @"\s*=\s*\$(true|false)", RegexOptions.Multiline);
         return m.Success ? (m.Groups[1].Value == "true") : fallback;
+    }
+
+    static double MatchDouble(string text, string name, double fallback)
+    {
+        Match m = Regex.Match(text, @"^\s*\$" + name + @"\s*=\s*([0-9]*\.?[0-9]+)", RegexOptions.Multiline);
+        double v;
+        return (m.Success && double.TryParse(m.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                CultureInfo.InvariantCulture, out v)) ? v : fallback;
     }
 
     static int MatchInt(string text, string name, int fallback)
@@ -226,8 +243,19 @@ class WatcherConfig
             if (d.TryGetValue("TransferTimeoutSeconds", out v) && v != null) TransferTimeoutSeconds = ToInt(v, TransferTimeoutSeconds);
             if (d.TryGetValue("ToolTableTransferMode", out v) && v != null)  ToolTableTransferMode = v.ToString();
             if (d.TryGetValue("ToolTableFolder", out v) && v != null)        ToolTableFolder = v.ToString();
+            if (d.TryGetValue("EnableStlTransfer", out v) && v is bool)      EnableStlTransfer = (bool)v;
+            if (d.TryGetValue("FixtureClearanceMM", out v) && v != null)     FixtureClearanceMM = ToDouble(v, FixtureClearanceMM);
+            if (d.TryGetValue("NcSettleDelaySeconds", out v) && v != null)   NcSettleDelaySeconds = ToInt(v, NcSettleDelaySeconds);
+            if (d.TryGetValue("StlUseSubfolderSidecarCheck", out v) && v is bool) StlUseSubfolderSidecarCheck = (bool)v;
         }
         catch { }
+    }
+
+    static double ToDouble(object v, double fallback)
+    {
+        double r;
+        return double.TryParse(v.ToString(), System.Globalization.NumberStyles.Float,
+               CultureInfo.InvariantCulture, out r) ? r : fallback;
     }
 
     static int ToInt(object v, int fallback)
@@ -250,6 +278,10 @@ class WatcherConfig
         d["TransferTimeoutSeconds"] = TransferTimeoutSeconds;
         d["ToolTableTransferMode"]  = ToolTableTransferMode;
         d["ToolTableFolder"]        = ToolTableFolder;
+        d["EnableStlTransfer"]      = EnableStlTransfer;
+        d["FixtureClearanceMM"]     = FixtureClearanceMM;
+        d["NcSettleDelaySeconds"]   = NcSettleDelaySeconds;
+        d["StlUseSubfolderSidecarCheck"] = StlUseSubfolderSidecarCheck;
         JavaScriptSerializer ser = new JavaScriptSerializer();
         File.WriteAllText(ConfigPath(baseDir), ser.Serialize(d));
     }
@@ -265,6 +297,8 @@ class SettingsForm : Form
     TextBox tbNasUser, tbNasPass;
     CheckBox cbSubdirs;
     ComboBox cbToolMode;
+    CheckBox cbStlEnable, cbStlSidecar;
+    TextBox tbClearance, tbSettle;
     string loadedToolTableFolder = "ToolTables"; // preserved across save (no UI field)
 
     public SettingsForm(string baseDir)
@@ -276,7 +310,7 @@ class SettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(520, 600);
+        ClientSize = new Size(520, 742);
         Font = new Font("Segoe UI", 9F);
 
         int y = 14;
@@ -349,6 +383,39 @@ class SettingsForm : Form
         btnSendTT.Click += delegate { BrowseAndSendToolTable(); };
         ttGrp.Controls.Add(btnSendTT);
         y += 126;
+
+        // ---- STL / simulation meshes ----
+        GroupBox sGrp = new GroupBox();
+        sGrp.Text = "Simulation meshes (STL)";
+        sGrp.SetBounds(12, y, 496, 132);
+        Controls.Add(sGrp);
+
+        cbStlEnable = new CheckBox();
+        cbStlEnable.Text = "Send STOCK / PART / FIXTURE meshes with the program";
+        cbStlEnable.SetBounds(12, 22, 400, 22);
+        sGrp.Controls.Add(cbStlEnable);
+
+        Label lc = new Label(); lc.Text = "Fixture shrink (mm/face):"; lc.SetBounds(12, 52, 150, 20); sGrp.Controls.Add(lc);
+        tbClearance = new TextBox(); tbClearance.SetBounds(166, 50, 60, 23); sGrp.Controls.Add(tbClearance);
+        Label lch = new Label();
+        lch.Text = "each face moves inward this far so DCM does not trip";
+        lch.ForeColor = Color.DimGray;
+        lch.SetBounds(232, 53, 256, 20);
+        sGrp.Controls.Add(lch);
+
+        Label ls = new Label(); ls.Text = "Program settle wait (s):"; ls.SetBounds(12, 80, 150, 20); sGrp.Controls.Add(ls);
+        tbSettle = new TextBox(); tbSettle.SetBounds(166, 78, 60, 23); sGrp.Controls.Add(tbSettle);
+        Label lsh = new Label();
+        lsh.Text = "wait for the post to finish moving the program";
+        lsh.ForeColor = Color.DimGray;
+        lsh.SetBounds(232, 81, 256, 20);
+        sGrp.Controls.Add(lsh);
+
+        cbStlSidecar = new CheckBox();
+        cbStlSidecar.Text = "Detect the post's temp program copy via its subfolder sidecar";
+        cbStlSidecar.SetBounds(12, 104, 460, 22);
+        sGrp.Controls.Add(cbStlSidecar);
+        y += 142;
 
         Label note = new Label();
         note.Text = "\"Save && Restart Service\" applies everything (admin prompt appears).";
@@ -435,6 +502,10 @@ class SettingsForm : Form
         tbXferTimeout.Text = c.TransferTimeoutSeconds.ToString();
         cbToolMode.SelectedItem = (c.ToolTableTransferMode == "Overwrite") ? "Overwrite" : "Merge";
         loadedToolTableFolder = c.ToolTableFolder;
+        cbStlEnable.Checked  = c.EnableStlTransfer;
+        cbStlSidecar.Checked = c.StlUseSubfolderSidecarCheck;
+        tbClearance.Text     = c.FixtureClearanceMM.ToString(CultureInfo.InvariantCulture);
+        tbSettle.Text        = c.NcSettleDelaySeconds.ToString(CultureInfo.InvariantCulture);
     }
 
     bool SaveAll()
@@ -454,6 +525,22 @@ class SettingsForm : Form
             !int.TryParse(tbXferTimeout.Text.Trim(), out xferT))
         {
             MessageBox.Show(this, "Retries, delay and timeouts must be whole numbers.", "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        double clearance;
+        int settle;
+        if (!double.TryParse(tbClearance.Text.Trim(), System.Globalization.NumberStyles.Float,
+                CultureInfo.InvariantCulture, out clearance) || clearance < 0)
+        {
+            MessageBox.Show(this, "Fixture shrink must be a number in millimetres (0 disables shrinking).",
+                "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+        if (!int.TryParse(tbSettle.Text.Trim(), out settle) || settle < 0)
+        {
+            MessageBox.Show(this, "Program settle wait must be a whole number of seconds (0 disables it).",
+                "TNCWatcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return false;
         }
 
@@ -480,6 +567,10 @@ class SettingsForm : Form
             c.TransferTimeoutSeconds = xferT;
             c.ToolTableTransferMode = (cbToolMode.SelectedItem != null) ? cbToolMode.SelectedItem.ToString() : "Merge";
             c.ToolTableFolder = loadedToolTableFolder;
+            c.EnableStlTransfer = cbStlEnable.Checked;
+            c.StlUseSubfolderSidecarCheck = cbStlSidecar.Checked;
+            c.FixtureClearanceMM = clearance;
+            c.NcSettleDelaySeconds = settle;
             c.SaveJson(baseDir);
         }
         catch (Exception ex)

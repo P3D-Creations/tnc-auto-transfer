@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.7.1
+  Version: 1.7.2
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -201,8 +201,23 @@ $StlAsciiOutput    = $true
 #      naming this NC file, the copy in hand is the transient one and the
 #      subfolder copy is authoritative.
 # Set the delay to 0 to disable both.
-$NcSettleDelaySeconds = 15
+#   3. Once a bundle has been sent, any leftover transient copy is retired to
+#      Processed. Skipping alone is not enough: the file stays in the watch
+#      folder, and by the time the fallback rescan finds it the sidecar has
+#      been archived, so nothing is left to recognise it by and it gets sent.
+#
+# The wait POLLS rather than sleeping once, so it reacts the moment the post
+# moves the file or writes the sidecar, however long that takes. Measured on
+# this machine: 19s between the transient appearing and the sidecar landing,
+# so a single 15s sleep-then-check missed it. A program already sitting in its
+# own program folder (sidecar beside it) is authoritative and skips the wait
+# entirely. Set the delay to 0 to disable all of this.
+$NcSettleDelaySeconds = 45
 $NcSettleExtensions   = @(".h", ".i")
+
+# Use the subfolder-sidecar structure to recognise a transient copy. Turn off
+# if the post is changed to write the program straight into its final folder.
+$StlUseSubfolderSidecarCheck = $true
 
 $StlMetaSchema           = "p3d.kern.fixture-stl-meta"
 $StlMetaMaxSchemaVersion = 1    # refuse anything newer rather than guess
@@ -298,6 +313,10 @@ if (Test-Path $ConfigFile) {
         if ($cfg.TransferTimeoutSeconds) { $TransferTimeoutSeconds = [int]$cfg.TransferTimeoutSeconds }
         if ($cfg.ToolTableTransferMode)  { $ToolTableTransferMode  = [string]$cfg.ToolTableTransferMode }
         if ($cfg.ToolTableFolder)        { $ToolTableFolder        = [string]$cfg.ToolTableFolder }
+        if ($null -ne $cfg.FixtureClearanceMM)     { $FixtureClearanceMM     = [double]$cfg.FixtureClearanceMM }
+        if ($null -ne $cfg.NcSettleDelaySeconds)   { $NcSettleDelaySeconds   = [int]$cfg.NcSettleDelaySeconds }
+        if ($null -ne $cfg.StlUseSubfolderSidecarCheck) { $StlUseSubfolderSidecarCheck = [bool]$cfg.StlUseSubfolderSidecarCheck }
+        if ($null -ne $cfg.EnableStlTransfer)      { $EnableStlTransfer      = [bool]$cfg.EnableStlTransfer }
         $ConfigOverridesActive = $true
     }
     catch {
@@ -1507,11 +1526,46 @@ function Send-StlBundle {
             if (Test-Path $src) { Move-ProcessedFile -FilePath $src -Success $true }
         }
         Move-ProcessedFile -FilePath $MetaFile -Success $true
+
+        # Retire the post's leftover transient program copy one level up. The
+        # bundle is done, so the authoritative copy has already been sent. If
+        # this is left behind, the fallback rescan finds it later - after the
+        # sidecar has been archived, so nothing identifies it as transient
+        # any more - and uploads it to the wrong place on the control.
+        if ($meta.program -and $meta.program.ncFile) {
+            $parent = [System.IO.Path]::GetDirectoryName($folder.TrimEnd('\', '/'))
+            $watchBase = $WatchFolder.TrimEnd('\', '/')
+            if ($parent -and $parent.Length -ge $watchBase.Length) {
+                $stray = Join-Path $parent ([string]$meta.program.ncFile)
+                if (Test-Path $stray) {
+                    Write-Log "Retiring the post's leftover transient copy: $([string]$meta.program.ncFile)" "WARNING"
+                    Move-ProcessedFile -FilePath $stray -Success $true
+                }
+            }
+        }
     }
     finally {
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item (Join-Path $folder "*.probe") -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Test-NcAuthoritative {
+    <#
+    .SYNOPSIS
+        True if this NC file is in its final resting place: a metadata sidecar
+        naming it sits in the SAME folder. Such a file needs no settle wait.
+    #>
+    param([string]$FilePath)
+
+    $dir  = [System.IO.Path]::GetDirectoryName($FilePath)
+    $name = [System.IO.Path]::GetFileName($FilePath)
+
+    foreach ($j in @(Get-ChildItem -Path $dir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
+        $m = Get-StlMeta -Path $j.FullName
+        if ($m -and $m.program -and ([string]$m.program.ncFile -ieq $name)) { return $true }
+    }
+    return $false
 }
 
 function Test-TransientNcCopy {
@@ -1657,15 +1711,25 @@ function Process-SingleFile {
     # Let the post finish relocating the program before touching it, then make
     # sure the copy in hand is the real one and not the pre-move transient.
     if ($NcSettleDelaySeconds -gt 0 -and ($NcSettleExtensions -contains $ext.ToLower())) {
-        Start-Sleep -Seconds $NcSettleDelaySeconds
 
-        if (-not (Test-Path $FilePath)) {
-            Write-Log "Program was relocated by the post during the settle delay; skipping that copy: $fileName" "DEBUG"
-            return
-        }
-        if (Test-TransientNcCopy -FilePath $FilePath) {
-            Write-Log "Skipping transient copy of $fileName - the authoritative copy is in its program subfolder." "DEBUG"
-            return
+        # A program sitting in its own program folder - sidecar right beside it -
+        # is the authoritative copy. No need to wait for anything.
+        if (-not (Test-NcAuthoritative -FilePath $FilePath)) {
+            $deadline = (Get-Date).AddSeconds($NcSettleDelaySeconds)
+            $settled = $false
+            while ((Get-Date) -lt $deadline) {
+                if (-not (Test-Path $FilePath)) {
+                    Write-Log "Program was relocated by the post; skipping that copy: $fileName" "DEBUG"
+                    return
+                }
+                if ($StlUseSubfolderSidecarCheck -and (Test-TransientNcCopy -FilePath $FilePath)) {
+                    Write-Log "Skipping transient copy of $fileName - the authoritative copy is in its program subfolder." "DEBUG"
+                    return
+                }
+                if (Test-NcAuthoritative -FilePath $FilePath) { $settled = $true; break }
+                Start-Sleep -Seconds 1
+            }
+            if (-not $settled -and -not (Test-Path $FilePath)) { return }
         }
     }
 
@@ -2023,7 +2087,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.7.1"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.7.2"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
@@ -2038,6 +2102,8 @@ function Start-FolderWatcher {
     Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] + folder '$ToolTableFolder' -> $ToolTableDestination (mode: $ToolTableTransferMode)"
     Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
     Write-Log "Ignore Junk:     $(if ($IgnoreSystemFiles) { 'on (system/hidden files silently skipped)' } else { 'off' })"
+    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
+    Write-Log "NC Settle:       ${NcSettleDelaySeconds}s, subfolder-sidecar check $(if ($StlUseSubfolderSidecarCheck) { 'on' } else { 'off' })"
     Write-Log "=============================================="
     
     # Initialize folders
