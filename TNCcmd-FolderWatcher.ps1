@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.9.0
+  Version: 1.9.1
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -179,6 +179,12 @@ $EnableStlTransfer = $true
 $StlPrepExe        = ".\TNCWatcher-StlPrep.exe"  # relative to this script, or absolute
 $StlMaxTriangles   = 19500      # control's limit is 20000; margin for safety
 $FixtureClearanceMM = 1.5       # each fixture face moves inward this far, to stop DCM tripping
+
+# Cut the fixture mesh at the attach plane and cap the openings. Geometry
+# below the attach point (pullstuds, retention knobs, bolts) sits inside the
+# machine's own chuck/table model, so DCM reports collisions against what is
+# really the clamping system itself. The cut keeps the mesh a closed volume.
+$FixtureCutBelowAttach = $true
 
 # Send meshes as ASCII STL rather than binary. The TNC 640 rejects a long run
 # of bytes containing no line break during PUT, even in /b (binary 1:1) mode,
@@ -357,6 +363,7 @@ if (Test-Path $ConfigFile) {
         if ($null -ne $cfg.NcStableSeconds)        { $NcStableSeconds        = [int]$cfg.NcStableSeconds }
         if ($null -ne $cfg.CleanupRemoteStray)     { $CleanupRemoteStray     = [bool]$cfg.CleanupRemoteStray }
         if ($null -ne $cfg.StlUseSubfolderSidecarCheck) { $StlUseSubfolderSidecarCheck = [bool]$cfg.StlUseSubfolderSidecarCheck }
+        if ($null -ne $cfg.FixtureCutBelowAttach)  { $FixtureCutBelowAttach  = [bool]$cfg.FixtureCutBelowAttach }
         if ($null -ne $cfg.EnableStlTransfer)      { $EnableStlTransfer      = [bool]$cfg.EnableStlTransfer }
         $ConfigOverridesActive = $true
     }
@@ -1589,6 +1596,7 @@ function Send-StlBundle {
                     Write-Log "  FIXTURE frame is suspect (see mismatch above) - uploading anyway, check it in simulation." "WARNING"
                 }
                 $prepArgs += @("--attach", $attachArg, "--clearance", "$FixtureClearanceMM")
+                if ($FixtureCutBelowAttach) { $prepArgs += "--cut-below-attach" }
             }
 
             $prepped = Join-Path $tempDir $rec.file
@@ -2235,7 +2243,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.9.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.9.1"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
@@ -2250,7 +2258,7 @@ function Start-FolderWatcher {
     Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] + folder '$ToolTableFolder' -> $ToolTableDestination (mode: $ToolTableTransferMode)"
     Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
     Write-Log "Ignore Junk:     $(if ($IgnoreSystemFiles) { 'on (system/hidden files silently skipped)' } else { 'off' })"
-    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
+    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, cut below attach $(if ($FixtureCutBelowAttach) { 'on' } else { 'off' }), $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
     Write-Log "NC Settle:       stable ${NcStableSeconds}s + sidecar grace ${NcSettleDelaySeconds}s, subfolder check $(if ($StlUseSubfolderSidecarCheck) { 'on' } else { 'off' }), remote stray cleanup $(if ($CleanupRemoteStray) { 'on' } else { 'off' })"
     Write-Log "=============================================="
     

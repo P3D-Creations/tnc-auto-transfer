@@ -150,6 +150,7 @@ class WatcherConfig
     public double FixtureClearanceMM = 1.5;
     public int NcSettleDelaySeconds = 45;
     public bool StlUseSubfolderSidecarCheck = true;
+    public bool FixtureCutBelowAttach = true;
 
     public static string ConfigPath(string baseDir) { return Path.Combine(baseDir, "TNCWatcher-Config.json"); }
     public static string ScriptPath(string baseDir) { return Path.Combine(baseDir, "TNCcmd-FolderWatcher.ps1"); }
@@ -192,6 +193,7 @@ class WatcherConfig
             FixtureClearanceMM     = MatchDouble(text, "FixtureClearanceMM", FixtureClearanceMM);
             NcSettleDelaySeconds   = MatchInt(text, "NcSettleDelaySeconds", NcSettleDelaySeconds);
             StlUseSubfolderSidecarCheck = MatchBool(text, "StlUseSubfolderSidecarCheck", StlUseSubfolderSidecarCheck);
+            FixtureCutBelowAttach  = MatchBool(text, "FixtureCutBelowAttach", FixtureCutBelowAttach);
         }
         catch { }
     }
@@ -247,6 +249,7 @@ class WatcherConfig
             if (d.TryGetValue("FixtureClearanceMM", out v) && v != null)     FixtureClearanceMM = ToDouble(v, FixtureClearanceMM);
             if (d.TryGetValue("NcSettleDelaySeconds", out v) && v != null)   NcSettleDelaySeconds = ToInt(v, NcSettleDelaySeconds);
             if (d.TryGetValue("StlUseSubfolderSidecarCheck", out v) && v is bool) StlUseSubfolderSidecarCheck = (bool)v;
+            if (d.TryGetValue("FixtureCutBelowAttach", out v) && v is bool) FixtureCutBelowAttach = (bool)v;
         }
         catch { }
     }
@@ -282,6 +285,7 @@ class WatcherConfig
         d["FixtureClearanceMM"]     = FixtureClearanceMM;
         d["NcSettleDelaySeconds"]   = NcSettleDelaySeconds;
         d["StlUseSubfolderSidecarCheck"] = StlUseSubfolderSidecarCheck;
+        d["FixtureCutBelowAttach"] = FixtureCutBelowAttach;
         JavaScriptSerializer ser = new JavaScriptSerializer();
         File.WriteAllText(ConfigPath(baseDir), ser.Serialize(d));
     }
@@ -297,7 +301,7 @@ class SettingsForm : Form
     TextBox tbNasUser, tbNasPass;
     CheckBox cbSubdirs;
     ComboBox cbToolMode;
-    CheckBox cbStlEnable, cbStlSidecar;
+    CheckBox cbStlEnable, cbStlSidecar, cbStlCut;
     TextBox tbClearance, tbSettle;
     string loadedToolTableFolder = "ToolTables"; // preserved across save (no UI field)
 
@@ -310,7 +314,7 @@ class SettingsForm : Form
         MaximizeBox = false;
         MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(520, 742);
+        ClientSize = new Size(520, 768);
         Font = new Font("Segoe UI", 9F);
 
         int y = 14;
@@ -387,7 +391,7 @@ class SettingsForm : Form
         // ---- STL / simulation meshes ----
         GroupBox sGrp = new GroupBox();
         sGrp.Text = "Simulation meshes (STL)";
-        sGrp.SetBounds(12, y, 496, 132);
+        sGrp.SetBounds(12, y, 496, 158);
         Controls.Add(sGrp);
 
         cbStlEnable = new CheckBox();
@@ -415,7 +419,12 @@ class SettingsForm : Form
         cbStlSidecar.Text = "Detect the post's temp program copy via its subfolder sidecar";
         cbStlSidecar.SetBounds(12, 104, 460, 22);
         sGrp.Controls.Add(cbStlSidecar);
-        y += 142;
+
+        cbStlCut = new CheckBox();
+        cbStlCut.Text = "Cut fixture below the attach point (stops false collisions with the clamp)";
+        cbStlCut.SetBounds(12, 128, 470, 22);
+        sGrp.Controls.Add(cbStlCut);
+        y += 168;
 
         Label note = new Label();
         note.Text = "\"Save && Restart Service\" applies everything (admin prompt appears).";
@@ -504,6 +513,7 @@ class SettingsForm : Form
         loadedToolTableFolder = c.ToolTableFolder;
         cbStlEnable.Checked  = c.EnableStlTransfer;
         cbStlSidecar.Checked = c.StlUseSubfolderSidecarCheck;
+        cbStlCut.Checked     = c.FixtureCutBelowAttach;
         tbClearance.Text     = c.FixtureClearanceMM.ToString(CultureInfo.InvariantCulture);
         tbSettle.Text        = c.NcSettleDelaySeconds.ToString(CultureInfo.InvariantCulture);
     }
@@ -569,6 +579,7 @@ class SettingsForm : Form
             c.ToolTableFolder = loadedToolTableFolder;
             c.EnableStlTransfer = cbStlEnable.Checked;
             c.StlUseSubfolderSidecarCheck = cbStlSidecar.Checked;
+            c.FixtureCutBelowAttach = cbStlCut.Checked;
             c.FixtureClearanceMM = clearance;
             c.NcSettleDelaySeconds = settle;
             c.SaveJson(baseDir);

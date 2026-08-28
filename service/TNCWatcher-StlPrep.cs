@@ -476,6 +476,256 @@ static class StlIO
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+
+// Cuts a mesh at the attach plane and caps the hole flat. Fixture geometry
+// below the attach point (pullstuds, retention knobs, bolt heads) sits inside
+// the machine's own chuck/table model on the control, so DCM flags collisions
+// against hardware that is really the clamping system itself. The cut removes
+// everything below the plane and closes the openings so the mesh stays a
+// closed volume.
+//
+// Requires a welded mesh (shared vertex indices) so that the intersection
+// point of an edge is computed once and shared by both triangles on it -
+// that is what keeps the cut seam free of cracks.
+static class PlaneCut
+{
+    public static Mesh CutBelowZ(Mesh m, double planeZ, double eps,
+                                 out int removedTris, out int capTris, out int capLoops,
+                                 List<string> warn)
+    {
+        removedTris = 0; capTris = 0; capLoops = 0;
+
+        // Work in a frame where the plane is exactly z = 0, and snap vertices
+        // within eps onto it so slivers cannot form along the seam.
+        List<Vec3> pos = new List<Vec3>(m.Verts.Count);
+        for (int i = 0; i < m.Verts.Count; i++)
+        {
+            Vec3 v = m.Verts[i];
+            double z = v.Z - planeZ;
+            if (Math.Abs(z) < eps) z = 0;
+            pos.Add(new Vec3(v.X, v.Y, z));
+        }
+
+        Mesh outM = new Mesh();
+        outM.Verts.AddRange(pos);
+        Dictionary<long, int> cutPoint = new Dictionary<long, int>();
+
+        for (int t = 0; t < m.Tris.Count; t += 3)
+        {
+            int i0 = m.Tris[t], i1 = m.Tris[t + 1], i2 = m.Tris[t + 2];
+            double z0 = outM.Verts[i0].Z, z1 = outM.Verts[i1].Z, z2 = outM.Verts[i2].Z;
+
+            if (z0 == 0 && z1 == 0 && z2 == 0)
+            {
+                // Coplanar with the cut. A DOWN-facing triangle here is real
+                // exterior bottom surface - keep it. An UP-facing one is the
+                // ceiling of geometry that just got cut away (e.g. the top of
+                // a pullstud); its volume is gone, so drop it - if a hole
+                // results, the capping pass below closes it facing down.
+                Vec3 pa = outM.Verts[i0], pb = outM.Verts[i1], pc = outM.Verts[i2];
+                double nz = (pb.X - pa.X) * (pc.Y - pa.Y) - (pb.Y - pa.Y) * (pc.X - pa.X);
+                if (nz > 0) { removedTris++; continue; }
+                outM.Tris.Add(i0); outM.Tris.Add(i1); outM.Tris.Add(i2);
+                continue;
+            }
+            if (z0 >= 0 && z1 >= 0 && z2 >= 0)
+            {
+                outM.Tris.Add(i0); outM.Tris.Add(i1); outM.Tris.Add(i2);
+                continue;
+            }
+            if (z0 <= 0 && z1 <= 0 && z2 <= 0) { removedTris++; continue; }
+
+            // Straddles the plane: Sutherland-Hodgman clip against z >= 0.
+            int[] idx = new int[] { i0, i1, i2 };
+            List<int> poly = new List<int>(4);
+            for (int k = 0; k < 3; k++)
+            {
+                int a = idx[k], b = idx[(k + 1) % 3];
+                double za = outM.Verts[a].Z, zb = outM.Verts[b].Z;
+                if (za >= 0) poly.Add(a);
+                if ((za > 0 && zb < 0) || (za < 0 && zb > 0))
+                    poly.Add(CutIdx(outM, cutPoint, a, b));
+            }
+            removedTris++;   // original triangle replaced by its clipped part
+            for (int k = 1; k + 1 < poly.Count; k++)
+            {
+                if (poly[0] == poly[k] || poly[k] == poly[k + 1] || poly[0] == poly[k + 1]) continue;
+                outM.Tris.Add(poly[0]); outM.Tris.Add(poly[k]); outM.Tris.Add(poly[k + 1]);
+            }
+        }
+
+        // ---- cap the openings ----
+        // Every hole the cut created shows up as a boundary edge (used by
+        // exactly one triangle) whose endpoints lie on the plane.
+        Dictionary<long, int> use = new Dictionary<long, int>();
+        Dictionary<long, long> dir = new Dictionary<long, long>();   // undirected key -> packed directed edge
+        for (int t = 0; t < outM.Tris.Count; t += 3)
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                int a = outM.Tris[t + k], b = outM.Tris[t + (k + 1) % 3];
+                long key = UKey(a, b);
+                int c; use.TryGetValue(key, out c); use[key] = c + 1;
+                if (c == 0) dir[key] = ((long)a << 32) | (uint)b;
+            }
+        }
+
+        Dictionary<int, int> succ = new Dictionary<int, int>();
+        foreach (KeyValuePair<long, int> kv in use)
+        {
+            if (kv.Value != 1) continue;
+            long d = dir[kv.Key];
+            int a = (int)(d >> 32), b = (int)(d & 0xFFFFFFFFL);
+            if (Math.Abs(outM.Verts[a].Z) > eps || Math.Abs(outM.Verts[b].Z) > eps) continue;
+            // The cap must oppose the surface winding, so walk b -> a.
+            if (!succ.ContainsKey(b)) succ[b] = a;
+        }
+
+        HashSet<int> visited = new HashSet<int>();
+        foreach (int start in new List<int>(succ.Keys))
+        {
+            if (visited.Contains(start)) continue;
+            List<int> loop = new List<int>();
+            int cur = start;
+            bool closed = false;
+            while (succ.ContainsKey(cur) && !visited.Contains(cur))
+            {
+                visited.Add(cur);
+                loop.Add(cur);
+                cur = succ[cur];
+                if (cur == start) { closed = true; break; }
+            }
+            if (!closed || loop.Count < 3)
+            {
+                if (loop.Count >= 3) warn.Add("plane cut: an open boundary chain of " + loop.Count + " edges could not be closed into a loop; that hole is left uncapped");
+                continue;
+            }
+
+            capLoops++;
+            int before = outM.Tris.Count;
+            Triangulate(outM, loop, warn);
+            capTris += (outM.Tris.Count - before) / 3;
+        }
+
+        // Compact: drop the vertices whose triangles were cut away, or they
+        // linger in the bounds and in the clearance pass as phantom geometry
+        // below the plane. Restore the original frame while copying.
+        Mesh packed = new Mesh();
+        int[] remap = new int[outM.Verts.Count];
+        for (int i = 0; i < remap.Length; i++) remap[i] = -1;
+        for (int t = 0; t < outM.Tris.Count; t++)
+        {
+            int vi = outM.Tris[t];
+            if (remap[vi] < 0)
+            {
+                remap[vi] = packed.Verts.Count;
+                Vec3 v = outM.Verts[vi];
+                packed.Verts.Add(new Vec3(v.X, v.Y, v.Z + planeZ));
+            }
+            packed.Tris.Add(remap[vi]);
+        }
+        return packed;
+    }
+
+    static int CutIdx(Mesh m, Dictionary<long, int> cache, int a, int b)
+    {
+        long key = UKey(a, b);
+        int idx;
+        if (cache.TryGetValue(key, out idx)) return idx;
+        int lo = Math.Min(a, b), hi = Math.Max(a, b);
+        Vec3 va = m.Verts[lo], vb = m.Verts[hi];
+        double t = va.Z / (va.Z - vb.Z);
+        Vec3 p = new Vec3(va.X + (vb.X - va.X) * t, va.Y + (vb.Y - va.Y) * t, 0);
+        idx = m.Verts.Count;
+        m.Verts.Add(p);
+        cache[key] = idx;
+        return idx;
+    }
+
+    static long UKey(int a, int b)
+    {
+        int lo = Math.Min(a, b), hi = Math.Max(a, b);
+        return ((long)lo << 32) | (uint)hi;
+    }
+
+    // Ear clipping in the XY plane; falls back to a centroid fan when no ear
+    // can be found (degenerate rims), which still closes the hole.
+    static void Triangulate(Mesh m, List<int> loop, List<string> warn)
+    {
+        List<int> v = new List<int>(loop);
+
+        double area = 0;
+        for (int i = 0; i < v.Count; i++)
+        {
+            Vec3 p = m.Verts[v[i]], q = m.Verts[v[(i + 1) % v.Count]];
+            area += p.X * q.Y - q.X * p.Y;
+        }
+        // Emit with the cap facing DOWN (-Z, outward from the solid above):
+        // a loop that is CCW in XY fans into +Z normals, so reverse it.
+        if (area > 0) v.Reverse();
+
+        int guard = v.Count * v.Count + 16;
+        while (v.Count > 3 && guard-- > 0)
+        {
+            bool clipped = false;
+            for (int i = 0; i < v.Count; i++)
+            {
+                int ia = v[(i + v.Count - 1) % v.Count], ib = v[i], ic = v[(i + 1) % v.Count];
+                Vec3 a = m.Verts[ia], b = m.Verts[ib], c = m.Verts[ic];
+                double cross = (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X);
+                if (cross >= -1e-12) continue;   // reflex or collinear for CW winding
+
+                bool inside = false;
+                for (int j = 0; j < v.Count; j++)
+                {
+                    if (v[j] == ia || v[j] == ib || v[j] == ic) continue;
+                    if (PointInTri(m.Verts[v[j]], a, b, c)) { inside = true; break; }
+                }
+                if (inside) continue;
+
+                m.Tris.Add(ia); m.Tris.Add(ib); m.Tris.Add(ic);
+                v.RemoveAt(i);
+                clipped = true;
+                break;
+            }
+            if (!clipped) break;
+        }
+
+        if (v.Count == 3)
+        {
+            m.Tris.Add(v[0]); m.Tris.Add(v[1]); m.Tris.Add(v[2]);
+        }
+        else if (v.Count > 3)
+        {
+            // Centroid fan fallback: not pretty on concave rims, but closed.
+            warn.Add("plane cut: ear clipping stalled on a " + loop.Count + "-edge rim; capped with a centroid fan");
+            double cx = 0, cy = 0;
+            for (int i = 0; i < v.Count; i++) { cx += m.Verts[v[i]].X; cy += m.Verts[v[i]].Y; }
+            Vec3 centre = new Vec3(cx / v.Count, cy / v.Count, m.Verts[v[0]].Z);
+            int ci = m.Verts.Count;
+            m.Verts.Add(centre);
+            for (int i = 0; i < v.Count; i++)
+            {
+                m.Tris.Add(ci); m.Tris.Add(v[i]); m.Tris.Add(v[(i + 1) % v.Count]);
+            }
+        }
+    }
+
+    static bool PointInTri(Vec3 p, Vec3 a, Vec3 b, Vec3 c)
+    {
+        double d1 = Sign(p, a, b), d2 = Sign(p, b, c), d3 = Sign(p, c, a);
+        bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+        bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+        return !(neg && pos);
+    }
+
+    static double Sign(Vec3 p, Vec3 a, Vec3 b)
+    {
+        return (p.X - a.X) * (b.Y - a.Y) - (b.X - a.X) * (p.Y - a.Y);
+    }
+}
+
 // Exact identity of a triangle regardless of winding. A plain hash is not
 // enough here: a collision would discard a genuine triangle and tear a hole in
 // the mesh.
@@ -988,6 +1238,7 @@ static class Program
         int topoCheckLimit = 400000;
         double speckFraction = 0.01;   // drop shells smaller than this fraction of the model diagonal
         bool pruneShells = true;
+        bool cutBelowAttach = false;
         bool preserveExtents = true;   // fraction of the coarse target edge used as the starting weld tolerance; 0 disables
         string stlUnits = "mm";
 
@@ -1018,6 +1269,7 @@ static class Program
             else if (a == "--progress-file" && i + 1 < args.Length) progressFile = args[++i];
             else if (a == "--coarse" && i + 1 < args.Length) coarse = double.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--no-prune") pruneShells = false;
+            else if (a == "--cut-below-attach") cutBelowAttach = true;
             else if (a == "--topo-limit" && i + 1 < args.Length) topoCheckLimit = int.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--speck" && i + 1 < args.Length) speckFraction = double.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--no-preserve-extents") preserveExtents = false;
@@ -1104,6 +1356,29 @@ static class Program
             if (mesh.TriangleCount != beforePrune) soup = mesh;   // coarse passes re-weld from the pruned mesh
         }
 
+        // Cut away everything below the attach plane and cap the openings,
+        // so mount features cannot collide with the machine's own clamp model.
+        int cutRemoved = 0, capTrisN = 0, capLoopsN = 0;
+        bool didCut = false;
+        List<string> cutWarn = new List<string>();
+        if (cutBelowAttach)
+        {
+            if (!haveAttach)
+            {
+                cutWarn.Add("--cut-below-attach needs an explicit --attach point; cut SKIPPED");
+            }
+            else
+            {
+                Prog.SetNow("cutting below the attach plane");
+                Vec3 cmn, cmx; mesh.Bounds(out cmn, out cmx);
+                double cutEps = Math.Max(1e-9, (cmx - cmn).Length() * 1e-6);
+                int beforeCut = mesh.TriangleCount;
+                mesh = PlaneCut.CutBelowZ(mesh, attach.Z, cutEps, out cutRemoved, out capTrisN, out capLoopsN, cutWarn);
+                didCut = true;
+                if (mesh.TriangleCount != beforeCut) soup = mesh;   // coarse passes re-weld from the cut mesh
+            }
+        }
+
         int coarsePasses = 0;
         if (maxTris > 0 && coarse > 0 && mesh.TriangleCount > maxTris * 8)
         {
@@ -1153,6 +1428,8 @@ static class Program
         int vertsBelowAnchor = 0;
         bool scaled = false;
         List<string> warn = new List<string>();
+        foreach (string w in cutWarn) warn.Add(w);
+
         if (topoIn != null && !topoIn.Closed)
         {
             warn.Add("input mesh is " + topoIn.Text() + " - the control expects a closed mesh; fix the export if it is rejected");
@@ -1244,6 +1521,10 @@ static class Program
             sb.Append(",\"coarse\":").Append(F(coarse));
             sb.Append(",\"topologyIn\":").Append(topoIn == null ? "null" : topoIn.Json());
             sb.Append(",\"topologyOut\":").Append(topoOut.Json());
+            sb.Append(",\"cutBelowAttach\":").Append(didCut ? "true" : "false");
+            sb.Append(",\"cutRemovedTris\":").Append(cutRemoved);
+            sb.Append(",\"capTriangles\":").Append(capTrisN);
+            sb.Append(",\"capLoops\":").Append(capLoopsN);
             sb.Append(",\"speckShells\":").Append(speckShells);
             sb.Append(",\"voidShells\":").Append(voidShells);
             sb.Append(",\"decimated\":").Append(decimated ? "true" : "false");
@@ -1335,6 +1616,7 @@ static class Program
         Console.Error.WriteLine("  --stl-units U    mm|in - unit of the mesh vertices (default mm). --clearance");
         Console.Error.WriteLine("                   is always mm and is converted to match.");
         Console.Error.WriteLine("  --probe          report as-read bounds only; write nothing");
+        Console.Error.WriteLine("  --cut-below-attach  remove everything below the attach plane and cap the hole");
         Console.Error.WriteLine("  --progress-file F  write a one-line status to F while working");
         Console.Error.WriteLine("  --ascii          write ASCII STL instead of binary. Required for the TNC 640:");
         Console.Error.WriteLine("                   it rejects long runs of bytes with no line break on PUT.");
