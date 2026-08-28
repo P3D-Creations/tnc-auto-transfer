@@ -403,10 +403,10 @@ class SettingsForm : Form
         lch.SetBounds(232, 53, 256, 20);
         sGrp.Controls.Add(lch);
 
-        Label ls = new Label(); ls.Text = "Program settle wait (s):"; ls.SetBounds(12, 80, 150, 20); sGrp.Controls.Add(ls);
+        Label ls = new Label(); ls.Text = "Sidecar grace (s):"; ls.SetBounds(12, 80, 150, 20); sGrp.Controls.Add(ls);
         tbSettle = new TextBox(); tbSettle.SetBounds(166, 78, 60, 23); sGrp.Controls.Add(tbSettle);
         Label lsh = new Label();
-        lsh.Text = "wait for the post to finish moving the program";
+        lsh.Text = "extra wait after a program stops growing, for its sidecar";
         lsh.ForeColor = Color.DimGray;
         lsh.SetBounds(232, 81, 256, 20);
         sGrp.Controls.Add(lsh);

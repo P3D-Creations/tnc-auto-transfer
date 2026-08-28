@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.8.1
+  Version: 1.9.0
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -228,18 +228,29 @@ $StlProgressIntervalSeconds = 10
 #      subfolder copy is authoritative.
 # Set the delay to 0 to disable both.
 #   3. Once a bundle has been sent, any leftover transient copy is retired to
-#      Processed. Skipping alone is not enough: the file stays in the watch
-#      folder, and by the time the fallback rescan finds it the sidecar has
-#      been archived, so nothing is left to recognise it by and it gets sent.
+#      Processed, and the matching stray on the CONTROL is deleted too (see
+#      $CleanupRemoteStray) - so even a copy that slipped through an earlier
+#      cycle gets cleaned up.
 #
-# The wait POLLS rather than sleeping once, so it reacts the moment the post
-# moves the file or writes the sidecar, however long that takes. Measured on
-# this machine: 19s between the transient appearing and the sidecar landing,
-# so a single 15s sleep-then-check missed it. A program already sitting in its
-# own program folder (sidecar beside it) is authoritative and skips the wait
-# entirely. Set the delay to 0 to disable all of this.
-$NcSettleDelaySeconds = 45
+# The gate is driven by FILE SIZE STABILITY, not a fixed delay: a program is
+# only considered finished once its size has stopped changing for
+# $NcStableSeconds. That both reacts as fast as the post actually writes
+# (small programs clear in seconds instead of a fixed 45s) and makes it
+# impossible to send a half-written file - a growing file keeps resetting the
+# clock. After stability, $NcSettleDelaySeconds is the GRACE window for the
+# post's sidecar to land and identify the copy as transient; if the program's
+# stem-named subfolder already exists (meshes still copying), the grace is
+# extended rather than racing the post. Set $NcStableSeconds = 0 to disable
+# the whole gate.
+$NcStableSeconds      = 8      # size must be unchanged this long = finished writing
+$NcSettleDelaySeconds = 15     # sidecar grace after stability (was a fixed pre-send delay)
 $NcSettleExtensions   = @(".h", ".i")
+
+# After a bundle uploads, delete the stray transient program copy one level up
+# ON THE CONTROL as well as locally. If a partial or duplicate parent-level
+# copy ever reached the machine, the authoritative program has just been sent,
+# so that stray is junk sitting next to real programs.
+$CleanupRemoteStray = $true
 
 # Use the subfolder-sidecar structure to recognise a transient copy. Turn off
 # if the post is changed to write the program straight into its final folder.
@@ -343,6 +354,8 @@ if (Test-Path $ConfigFile) {
         if ($null -ne $cfg.StlPrepTimeoutSeconds) { $StlPrepTimeoutSeconds = [int]$cfg.StlPrepTimeoutSeconds }
         if ($null -ne $cfg.FixtureClearanceMM)     { $FixtureClearanceMM     = [double]$cfg.FixtureClearanceMM }
         if ($null -ne $cfg.NcSettleDelaySeconds)   { $NcSettleDelaySeconds   = [int]$cfg.NcSettleDelaySeconds }
+        if ($null -ne $cfg.NcStableSeconds)        { $NcStableSeconds        = [int]$cfg.NcStableSeconds }
+        if ($null -ne $cfg.CleanupRemoteStray)     { $CleanupRemoteStray     = [bool]$cfg.CleanupRemoteStray }
         if ($null -ne $cfg.StlUseSubfolderSidecarCheck) { $StlUseSubfolderSidecarCheck = [bool]$cfg.StlUseSubfolderSidecarCheck }
         if ($null -ne $cfg.EnableStlTransfer)      { $EnableStlTransfer      = [bool]$cfg.EnableStlTransfer }
         $ConfigOverridesActive = $true
@@ -1622,6 +1635,21 @@ function Send-StlBundle {
                 }
             }
         }
+
+        # Delete the stray transient copy ON THE CONTROL too. If a parent-level
+        # copy won an earlier race (or arrived partial), the authoritative
+        # program has just gone up, so that remote copy is junk. DEL of a file
+        # that does not exist is a cheap no-op.
+        if ($CleanupRemoteStray -and $meta.program -and $meta.program.ncFile) {
+            $remoteTrim = $RemotePath.TrimEnd('\', '/')
+            $destTrim   = $DestinationFolder.TrimEnd('\', '/')
+            $cut = $remoteTrim.LastIndexOf('\')
+            if ($cut -ge $destTrim.Length) {
+                $strayRemote = $remoteTrim.Substring(0, $cut) + '\' + [string]$meta.program.ncFile
+                Write-Log "Removing any stray transient copy on the control: $strayRemote" "DEBUG"
+                $null = Remove-RemoteFile -RemoteFilePath $strayRemote
+            }
+        }
     }
     finally {
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -1764,7 +1792,8 @@ function Process-SingleFile {
         # at this instant. Give the move the same settle window before deciding,
         # otherwise the meshes could be sent ahead of their program.
         if ($ncPath -and -not (Test-Path $ncPath) -and $NcSettleDelaySeconds -gt 0) {
-            Start-Sleep -Seconds $NcSettleDelaySeconds
+            $moveDeadline = (Get-Date).AddSeconds($NcStableSeconds + $NcSettleDelaySeconds)
+            while ((Get-Date) -lt $moveDeadline -and -not (Test-Path $ncPath)) { Start-Sleep -Seconds 1 }
         }
 
         if ($ncPath -and (Test-Path $ncPath)) {
@@ -1789,14 +1818,18 @@ function Process-SingleFile {
     # ---- NC program settle gate ------------------------------------------
     # Let the post finish relocating the program before touching it, then make
     # sure the copy in hand is the real one and not the pre-move transient.
-    if ($NcSettleDelaySeconds -gt 0 -and ($NcSettleExtensions -contains $ext.ToLower())) {
+    if ($NcStableSeconds -gt 0 -and ($NcSettleExtensions -contains $ext.ToLower())) {
 
         # A program sitting in its own program folder - sidecar right beside it -
         # is the authoritative copy. No need to wait for anything.
         if (-not (Test-NcAuthoritative -FilePath $FilePath)) {
-            $deadline = (Get-Date).AddSeconds($NcSettleDelaySeconds)
-            $settled = $false
-            while ((Get-Date) -lt $deadline) {
+            $lastSize = -1L
+            $lastChange = Get-Date
+            $graceUntil = $null
+            $graceExtensions = 0
+            $lastHeartbeat = Get-Date
+
+            while ($true) {
                 if (-not (Test-Path $FilePath)) {
                     Write-Log "Program was relocated by the post; skipping that copy: $fileName" "DEBUG"
                     return
@@ -1805,10 +1838,46 @@ function Process-SingleFile {
                     Write-Log "Skipping transient copy of $fileName - the authoritative copy is in its program subfolder." "DEBUG"
                     return
                 }
-                if (Test-NcAuthoritative -FilePath $FilePath) { $settled = $true; break }
+                if (Test-NcAuthoritative -FilePath $FilePath) { break }   # sidecar landed beside it - send now
+
+                # Size stability: a growing file resets the clock, so a
+                # half-written program can never fall through and be sent.
+                $size = -1L
+                try { $size = (Get-Item -LiteralPath $FilePath -Force -ErrorAction Stop).Length } catch {}
+                if ($size -ne $lastSize) {
+                    $lastSize = $size
+                    $lastChange = Get-Date
+                    $graceUntil = $null
+                }
+
+                $stableFor = ((Get-Date) - $lastChange).TotalSeconds
+                if ($stableFor -ge $NcStableSeconds) {
+                    if ($null -eq $graceUntil) {
+                        # Finished writing. Give the post's sidecar a short
+                        # window to land and mark this copy transient.
+                        $graceUntil = (Get-Date).AddSeconds($NcSettleDelaySeconds)
+                    }
+                    elseif ((Get-Date) -ge $graceUntil) {
+                        # If the stem-named program subfolder exists, the post
+                        # is mid-export (meshes still copying) - keep waiting
+                        # instead of racing it. Bounded so an unrelated folder
+                        # with the same name cannot block a program forever.
+                        $stemDir = Join-Path ([System.IO.Path]::GetDirectoryName($FilePath)) ([System.IO.Path]::GetFileNameWithoutExtension($FilePath))
+                        if ($StlUseSubfolderSidecarCheck -and $graceExtensions -lt 12 -and (Test-Path $stemDir)) {
+                            $graceExtensions++
+                            $graceUntil = (Get-Date).AddSeconds($NcSettleDelaySeconds)
+                            Write-Log "Subfolder '$([System.IO.Path]::GetFileNameWithoutExtension($FilePath))' exists; extending sidecar grace for $fileName ($graceExtensions)" "DEBUG"
+                        }
+                        else { break }   # genuinely a standalone program - send it
+                    }
+                }
+                elseif (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 30) {
+                    $lastHeartbeat = Get-Date
+                    Write-Log "Waiting for $fileName to finish writing ($([math]::Round($size/1MB,1)) MB so far)..." "DEBUG"
+                }
+
                 Start-Sleep -Seconds 1
             }
-            if (-not $settled -and -not (Test-Path $FilePath)) { return }
         }
     }
 
@@ -2166,7 +2235,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.8.1"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.9.0"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
@@ -2182,7 +2251,7 @@ function Start-FolderWatcher {
     Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
     Write-Log "Ignore Junk:     $(if ($IgnoreSystemFiles) { 'on (system/hidden files silently skipped)' } else { 'off' })"
     Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
-    Write-Log "NC Settle:       ${NcSettleDelaySeconds}s, subfolder-sidecar check $(if ($StlUseSubfolderSidecarCheck) { 'on' } else { 'off' })"
+    Write-Log "NC Settle:       stable ${NcStableSeconds}s + sidecar grace ${NcSettleDelaySeconds}s, subfolder check $(if ($StlUseSubfolderSidecarCheck) { 'on' } else { 'off' }), remote stray cleanup $(if ($CleanupRemoteStray) { 'on' } else { 'off' })"
     Write-Log "=============================================="
     
     # Initialize folders

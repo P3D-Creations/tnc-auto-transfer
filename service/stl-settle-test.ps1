@@ -8,6 +8,9 @@ $src = $src.Substring(0, $src.IndexOf('# MAIN SCRIPT'))
 $src = $src -replace '(?m)^\$WatchFolder\s*=\s*".*"', ('$WatchFolder = "' + (Join-Path $SD 'watch2') + '"')
 $src = $src -replace '(?m)^\$LogFile\s*=\s*".*"', '$LogFile = "$env:TEMP\settle.log"'
 $src = $src -replace '(?m)^\$EnableLogging\s*=\s*\$true', '$EnableLogging = $false'
+$src = $src -replace 'TNCWatcher-Config.json', 'TNCWatcher-Config.HARNESS-IGNORED.json'
+$src = $src -replace '(?m)^\$NcSettleDelaySeconds\s*=\s*\d+', '$NcSettleDelaySeconds = 3'
+$src = $src -replace '(?m)^\$NcStableSeconds\s*=\s*\d+', '$NcStableSeconds = 2'
 $src = $src -replace '(?m)^\$NcSettleDelaySeconds\s*=\s*15', '$NcSettleDelaySeconds = 3'   # keep the test quick
 Invoke-Expression $src
 $StlPrepExe = "N:/Electronics and Software Projects/tnc-auto-transfer/TNCWatcher-StlPrep.exe"
@@ -19,6 +22,11 @@ function Send-FileToMachine {
     return @{ Success = $true; Retryable = $false }
 }
 function New-RemoteDirectory { param([string]$RemotePath,[string]$BasePath) }
+function Remove-RemoteFile { param([string]$RemoteFilePath)
+  $script:Deleted += $RemoteFilePath
+  Write-Host "    [DEL ] $RemoteFilePath" -ForegroundColor DarkYellow
+  return $true }
+$script:Deleted = @()
 
 $script:Sent = @()
 $w = Join-Path $SD 'watch2'
