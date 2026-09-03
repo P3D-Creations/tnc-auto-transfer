@@ -270,30 +270,41 @@ static class Topo
         }
     }
 
+    // Sort-and-scan instead of a Dictionary: the packed edge key (lo<<32)|hi
+    // hashes as lo^hi in a Dictionary<long,>, and welding gives neighbouring
+    // vertices neighbouring indices, so nearly every edge of a big mesh piles
+    // into a handful of buckets and the "check" goes quadratic (minutes on a
+    // 1.26M-triangle stock). Sorting 3.8M longs takes well under a second.
     public static Report Check(Mesh m)
     {
         Report r = new Report();
         r.Triangles = m.TriangleCount;
-        Dictionary<long, int> edge = new Dictionary<long, int>();
+        long[] keys = new long[m.Tris.Count];
+        int n = 0;
         for (int t = 0; t < m.Tris.Count; t += 3)
         {
             int a = m.Tris[t], b = m.Tris[t + 1], c = m.Tris[t + 2];
             if (a == b || b == c || a == c) { r.Degenerate++; continue; }
-            Bump(edge, a, b); Bump(edge, b, c); Bump(edge, c, a);
+            keys[n++] = Pack(a, b); keys[n++] = Pack(b, c); keys[n++] = Pack(c, a);
         }
-        foreach (KeyValuePair<long, int> kv in edge)
+        Array.Sort(keys, 0, n);
+        int i = 0;
+        while (i < n)
         {
-            if (kv.Value == 1) r.Boundary++;
-            else if (kv.Value > 2) r.NonManifold++;
+            int j = i + 1;
+            while (j < n && keys[j] == keys[i]) j++;
+            int cnt = j - i;
+            if (cnt == 1) r.Boundary++;
+            else if (cnt > 2) r.NonManifold++;
+            i = j;
         }
         return r;
     }
 
-    static void Bump(Dictionary<long, int> d, int a, int b)
+    static long Pack(int a, int b)
     {
-        int lo = Math.Min(a, b), hi = Math.Max(a, b);
-        long k = ((long)lo << 32) | (uint)hi;
-        int v; d.TryGetValue(k, out v); d[k] = v + 1;
+        int lo = a < b ? a : b, hi = a < b ? b : a;
+        return ((long)lo << 32) | (uint)hi;
     }
 }
 
@@ -823,19 +834,267 @@ static class Weld
 
 // ---------------------------------------------------------------------------
 
+// Closes holes: boundary edges (used by exactly one triangle) are chained into
+// loops and each loop is triangulated shut. Two sources of holes reach this:
+// a coarse weld tearing thin features on huge meshes, and exports that arrive
+// broken. The fill is deliberately crude - the control requires the mesh to be
+// CLOSED, and these tears sit far below the visual scale - but the winding is
+// exact: fill triangles oppose the surviving surface's edge directions, so the
+// patch faces outward without needing any geometric normal guess.
+//
+// Runs in passes. Chaining takes the first successor at a vertex, so a torn,
+// non-manifold rim where several loops share a vertex closes over several
+// passes: each pass fills what it can chain, which frees the shared vertices
+// for the next.
+static class HoleFill
+{
+    public static void Run(Mesh m, ref int loopsFilled, ref int fillTris, List<string> warn)
+    {
+        // Boundary edge a->b appears in exactly one triangle; the fill must
+        // oppose the surface winding, so chain the reverse direction b -> a.
+        // Sort-and-scan, not a Dictionary - see the note on Topo.Check.
+        long[] keys = new long[m.Tris.Count];
+        long[] dirs = new long[m.Tris.Count];
+        int n = 0;
+        for (int t = 0; t < m.Tris.Count; t += 3)
+        {
+            for (int k = 0; k < 3; k++)
+            {
+                int a = m.Tris[t + k], b = m.Tris[t + (k + 1) % 3];
+                if (a == b) continue;
+                keys[n] = Key(a, b);
+                dirs[n] = ((long)a << 32) | (uint)b;
+                n++;
+            }
+        }
+        Array.Sort(keys, dirs, 0, n);
+
+        // A torn rim can pass through the same vertex several times, so a
+        // single-successor map fragments the cycles into dead-end chains.
+        // Keep EVERY outgoing edge and extract cycles Eulerian-style: walk
+        // consuming edges, and whenever the walk revisits a vertex already on
+        // its own path, split that sub-cycle off and fill it.
+        Dictionary<int, List<int>> succ = new Dictionary<int, List<int>>();
+        int boundary = 0;
+        int ei = 0;
+        while (ei < n)
+        {
+            int ej = ei + 1;
+            while (ej < n && keys[ej] == keys[ei]) ej++;
+            if (ej - ei == 1)
+            {
+                long d = dirs[ei];
+                int a = (int)(d >> 32), b = (int)(d & 0xFFFFFFFFL);
+                List<int> lst;
+                if (!succ.TryGetValue(b, out lst)) { lst = new List<int>(); succ[b] = lst; }
+                lst.Add(a);
+                boundary++;
+            }
+            ei = ej;
+        }
+        if (boundary == 0) return;
+
+        foreach (int start in new List<int>(succ.Keys))
+        {
+            while (true)
+            {
+                List<int> s0;
+                if (!succ.TryGetValue(start, out s0) || s0.Count == 0) break;
+
+                List<int> path = new List<int>();
+                Dictionary<int, int> posInPath = new Dictionary<int, int>();
+                int cur = start;
+                int guard = boundary + 8;
+                while (guard-- > 0)
+                {
+                    List<int> outs;
+                    if (!succ.TryGetValue(cur, out outs) || outs.Count == 0)
+                    {
+                        // Dead end: inconsistent winding or an edge already
+                        // consumed by a filled sub-cycle. Whatever remains on
+                        // the path cannot close; drop it.
+                        break;
+                    }
+                    int next = outs[outs.Count - 1];
+                    outs.RemoveAt(outs.Count - 1);
+                    posInPath[cur] = path.Count;
+                    path.Add(cur);
+                    cur = next;
+
+                    if (cur == start)
+                    {
+                        if (path.Count >= 3) { Fill(m, path, ref loopsFilled, ref fillTris); }
+                        break;
+                    }
+                    int at;
+                    if (posInPath.TryGetValue(cur, out at))
+                    {
+                        // Sub-cycle: fill it and keep walking from the pinch
+                        // vertex with the rest of the path intact.
+                        List<int> sub = path.GetRange(at, path.Count - at);
+                        if (sub.Count >= 3) { Fill(m, sub, ref loopsFilled, ref fillTris); }
+                        for (int i = at; i < path.Count; i++) posInPath.Remove(path[i]);
+                        path.RemoveRange(at, path.Count - at);
+                    }
+                }
+            }
+        }
+    }
+
+    static void Fill(Mesh m, List<int> loop, ref int loopsFilled, ref int fillTris)
+    {
+        int before = m.Tris.Count;
+        Fill(m, loop);
+        fillTris += (m.Tris.Count - before) / 3;
+        loopsFilled++;
+    }
+
+    // The loop's vertex ORDER is fixed by topology (it already opposes the
+    // surface winding), so unlike a planar cap it must never be reversed -
+    // the ear test adapts to the loop's own signed area instead.
+    static void Fill(Mesh m, List<int> loop)
+    {
+        if (loop.Count == 3)
+        {
+            m.Tris.Add(loop[0]); m.Tris.Add(loop[1]); m.Tris.Add(loop[2]);
+            return;
+        }
+        // Ear clipping is O(n^3) worst case; a giant torn rim gets the O(n)
+        // centroid fan, which still closes it.
+        if (loop.Count > 256) { Fan(m, loop); return; }
+
+        // Project onto the loop's best-fit plane (Newell normal).
+        double nx = 0, ny = 0, nz = 0;
+        for (int i = 0; i < loop.Count; i++)
+        {
+            Vec3 p = m.Verts[loop[i]], q = m.Verts[loop[(i + 1) % loop.Count]];
+            nx += (p.Y - q.Y) * (p.Z + q.Z);
+            ny += (p.Z - q.Z) * (p.X + q.X);
+            nz += (p.X - q.X) * (p.Y + q.Y);
+        }
+        double nl = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+        if (nl < 1e-30) { Fan(m, loop); return; }
+        nx /= nl; ny /= nl; nz /= nl;
+        // Basis perpendicular to the normal.
+        double ax = Math.Abs(nx), ay = Math.Abs(ny), az = Math.Abs(nz);
+        double ux, uy, uz;
+        if (ax <= ay && ax <= az) { ux = 0; uy = -nz; uz = ny; }
+        else if (ay <= az) { ux = -nz; uy = 0; uz = nx; }
+        else { ux = -ny; uy = nx; uz = 0; }
+        double ul = Math.Sqrt(ux * ux + uy * uy + uz * uz);
+        ux /= ul; uy /= ul; uz /= ul;
+        double vx = ny * uz - nz * uy, vy = nz * ux - nx * uz, vz = nx * uy - ny * ux;
+
+        List<int> v = new List<int>(loop);
+        Dictionary<int, double> U = new Dictionary<int, double>();
+        Dictionary<int, double> V = new Dictionary<int, double>();
+        for (int i = 0; i < v.Count; i++)
+        {
+            Vec3 p = m.Verts[v[i]];
+            if (!U.ContainsKey(v[i]))
+            {
+                U[v[i]] = p.X * ux + p.Y * uy + p.Z * uz;
+                V[v[i]] = p.X * vx + p.Y * vy + p.Z * vz;
+            }
+        }
+
+        double area = 0;
+        for (int i = 0; i < v.Count; i++)
+        {
+            int a = v[i], b = v[(i + 1) % v.Count];
+            area += U[a] * V[b] - U[b] * V[a];
+        }
+        double sgn = area >= 0 ? 1.0 : -1.0;
+
+        int guard = v.Count * v.Count + 16;
+        while (v.Count > 3 && guard-- > 0)
+        {
+            bool clipped = false;
+            for (int i = 0; i < v.Count; i++)
+            {
+                int ia = v[(i + v.Count - 1) % v.Count], ib = v[i], ic = v[(i + 1) % v.Count];
+                double cross = (U[ib] - U[ia]) * (V[ic] - V[ia]) - (V[ib] - V[ia]) * (U[ic] - U[ia]);
+                if (cross * sgn <= 1e-12) continue;   // reflex or collinear for this loop's winding
+
+                bool inside = false;
+                for (int j = 0; j < v.Count; j++)
+                {
+                    if (v[j] == ia || v[j] == ib || v[j] == ic) continue;
+                    if (PointInTri2(U[v[j]], V[v[j]], U[ia], V[ia], U[ib], V[ib], U[ic], V[ic])) { inside = true; break; }
+                }
+                if (inside) continue;
+
+                m.Tris.Add(ia); m.Tris.Add(ib); m.Tris.Add(ic);
+                v.RemoveAt(i);
+                clipped = true;
+                break;
+            }
+            if (!clipped) break;
+        }
+
+        if (v.Count == 3) { m.Tris.Add(v[0]); m.Tris.Add(v[1]); m.Tris.Add(v[2]); }
+        else if (v.Count > 3) Fan(m, v);
+    }
+
+    static void Fan(Mesh m, List<int> loop)
+    {
+        double cx = 0, cy = 0, cz = 0;
+        for (int i = 0; i < loop.Count; i++)
+        {
+            Vec3 p = m.Verts[loop[i]];
+            cx += p.X; cy += p.Y; cz += p.Z;
+        }
+        int ci = m.Verts.Count;
+        m.Verts.Add(new Vec3(cx / loop.Count, cy / loop.Count, cz / loop.Count));
+        for (int i = 0; i < loop.Count; i++)
+        {
+            m.Tris.Add(ci); m.Tris.Add(loop[i]); m.Tris.Add(loop[(i + 1) % loop.Count]);
+        }
+    }
+
+    static bool PointInTri2(double px, double py, double x1, double y1, double x2, double y2, double x3, double y3)
+    {
+        double d1 = (px - x1) * (y2 - y1) - (x2 - x1) * (py - y1);
+        double d2 = (px - x2) * (y3 - y2) - (x3 - x2) * (py - y2);
+        double d3 = (px - x3) * (y1 - y3) - (x1 - x3) * (py - y3);
+        bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+        bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+        return !(neg && pos);
+    }
+
+    static long Key(int a, int b)
+    {
+        int lo = Math.Min(a, b), hi = Math.Max(a, b);
+        return ((long)lo << 32) | (uint)hi;
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 class Decimator
 {
     Vec3[] pos;
     Quadric[] quad;
     bool[] vDead;
+    bool[] vNoCollapse;   // vertices on non-manifold edges: collapsing there tears holes
     int[] tri;            // flat, 3 per triangle
     bool[] tDead;
     HashSet<int>[] vTris; // incident triangles per vertex
     int liveTris;
 
-    class Cand { public double Cost; public int A, B; public Vec3 P; }
-
-    List<Cand> heap = new List<Cand>();
+    // Min-heap of collapse candidates as a flat struct array: no per-entry
+    // allocation, no GC pressure. Entries carry the stamp of each endpoint at
+    // push time; a collapse bumps the survivor's stamp, so anything pushed
+    // before is recognised as stale on pop and dropped in O(1) - the fresh
+    // replacements were pushed by the collapse itself. (A vertex's quadric
+    // only changes when it survives a collapse, so matching stamps mean the
+    // stored cost is still exact.)
+    struct Cand { public double Cost; public int A, B, SA, SB; }
+    Cand[] heap = new Cand[1 << 16];
+    int heapN;
+    int[] stamp;
+    long[] edgeKeys;      // sorted unique-ish edge census built in Build
+    int edgeKeyN;
 
     public bool PreserveExtents = true;
     Vec3 clampLo, clampHi;
@@ -846,39 +1105,44 @@ class Decimator
         Build(src);
         maxDeviation = 0;
 
-        // Seed the heap with every unique edge.
-        HashSet<long> seen = new HashSet<long>();
-        for (int t = 0; t < tri.Length; t += 3)
+        // Seed the heap with every unique edge (the census is already sorted).
+        int si = 0;
+        while (si < edgeKeyN)
         {
-            AddEdgeOnce(seen, tri[t], tri[t + 1]);
-            AddEdgeOnce(seen, tri[t + 1], tri[t + 2]);
-            AddEdgeOnce(seen, tri[t + 2], tri[t]);
+            int sj = si + 1;
+            while (sj < edgeKeyN && edgeKeys[sj] == edgeKeys[si]) sj++;
+            int sa = (int)(edgeKeys[si] >> 32);
+            int sb = (int)(edgeKeys[si] & 0xFFFFFFFFL);
+            Vec3 sp; double sc;
+            Evaluate(sa, sb, out sp, out sc);
+            Push(sc, sa, sb);
+            si = sj;
         }
-        Heapify();
+        edgeKeys = null;
 
         int startTris = liveTris;
         int spins = 0;
-        while (liveTris > target && heap.Count > 0)
+        while (liveTris > target && heapN > 0)
         {
-            if ((++spins & 1023) == 0 && startTris > target)
+            if ((++spins & 8191) == 0 && startTris > target)
             {
                 double pct = 100.0 * (startTris - liveTris) / (double)(startTris - target);
                 if (pct > 99.9) pct = 99.9;
                 Prog.Set("decimating " + pct.ToString("0") + "% (" + liveTris + " triangles left)");
             }
 
-            Cand c = Pop();
-            if (c == null) break;
+            Cand c;
+            if (!Pop(out c)) break;
             if (vDead[c.A] || vDead[c.B]) continue;
+            if (stamp[c.A] != c.SA || stamp[c.B] != c.SB) continue;   // superseded by a later push
+            if (vNoCollapse[c.A] || vNoCollapse[c.B]) continue;
             if (!AreAdjacent(c.A, c.B)) continue;
+            if (!LinkConditionOk(c.A, c.B)) continue;
 
-            // Lazy revalidation: the incident quadrics may have changed since
-            // this entry was pushed, so recompute and re-queue if it got worse.
+            // Recompute the placement only on acceptance; the cost itself is
+            // still exact (see the stamp invariant above).
             Vec3 p; double cost;
             Evaluate(c.A, c.B, out p, out cost);
-            if (cost > c.Cost * 1.0001 + 1e-12) { Push(new Cand { Cost = cost, A = c.A, B = c.B, P = p }); continue; }
-
-            if (!LinkConditionOk(c.A, c.B)) continue;
             if (WouldFlip(c.A, c.B, p)) continue;
 
             double dev = Math.Sqrt(Math.Max(0, cost));
@@ -899,6 +1163,7 @@ class Decimator
         quad = new Quadric[pos.Length];
         liveTris = tri.Length / 3;
 
+        stamp = new int[pos.Length];
         vTris = new HashSet<int>[pos.Length];
         for (int i = 0; i < pos.Length; i++) vTris[i] = new HashSet<int>();
 
@@ -947,19 +1212,45 @@ class Decimator
             }
         }
 
-        // Constrain open boundaries so the silhouette of an open mesh holds.
-        Dictionary<long, int> edgeUse = new Dictionary<long, int>();
+        // Edge census, sorted (see the note on Topo.Check for why this is not
+        // a Dictionary). Feeds the boundary constraints, the non-manifold
+        // freeze, and the heap seeding.
+        edgeKeys = new long[tri.Length];
+        edgeKeyN = 0;
         for (int t = 0; t < tri.Length; t += 3)
         {
-            Bump(edgeUse, tri[t], tri[t + 1]);
-            Bump(edgeUse, tri[t + 1], tri[t + 2]);
-            Bump(edgeUse, tri[t + 2], tri[t]);
+            AddKey(tri[t], tri[t + 1]);
+            AddKey(tri[t + 1], tri[t + 2]);
+            AddKey(tri[t + 2], tri[t]);
         }
-        foreach (KeyValuePair<long, int> kv in edgeUse)
+        Array.Sort(edgeKeys, 0, edgeKeyN);
+
+        vNoCollapse = new bool[pos.Length];
+        int i0 = 0;
+        while (i0 < edgeKeyN)
         {
-            if (kv.Value != 1) continue;               // interior edge
-            int a = (int)(kv.Key >> 32);
-            int b = (int)(kv.Key & 0xFFFFFFFFL);
+            int j0 = i0 + 1;
+            while (j0 < edgeKeyN && edgeKeys[j0] == edgeKeys[i0]) j0++;
+            int cnt = j0 - i0;
+            int a = (int)(edgeKeys[i0] >> 32);
+            int b = (int)(edgeKeys[i0] & 0xFFFFFFFFL);
+            i0 = j0;
+
+            // A non-manifold edge carries 3+ faces. Collapsing it kills every
+            // one of them at once, leaving the surviving neighbours' edges
+            // unbalanced - that is exactly where decimation used to tear holes
+            // in a mesh the coarse weld had left non-manifold but CLOSED. Such
+            // edges are rare (seams), so freezing their vertices costs almost
+            // no budget and keeps the closure intact.
+            if (cnt > 2)
+            {
+                vNoCollapse[a] = true;
+                vNoCollapse[b] = true;
+                continue;
+            }
+            if (cnt != 1) continue;                    // interior edge
+
+            // Constrain open boundaries so the silhouette of an open mesh holds.
             Vec3 dir = (pos[b] - pos[a]);
             double len = dir.Length();
             if (len < 1e-15) continue;
@@ -972,6 +1263,8 @@ class Decimator
             quad[b] = quad[b] + q;
         }
     }
+
+    void AddKey(int a, int b) { if (a != b) edgeKeys[edgeKeyN++] = Key(a, b); }
 
     Vec3 FaceNormalContaining(int a, int b)
     {
@@ -986,26 +1279,10 @@ class Decimator
         return new Vec3(0, 0, 1);
     }
 
-    static void Bump(Dictionary<long, int> d, int a, int b)
-    {
-        long k = Key(a, b);
-        int v;
-        d.TryGetValue(k, out v);
-        d[k] = v + 1;
-    }
-
     static long Key(int a, int b)
     {
         int lo = Math.Min(a, b), hi = Math.Max(a, b);
         return ((long)lo << 32) | (uint)hi;
-    }
-
-    void AddEdgeOnce(HashSet<long> seen, int a, int b)
-    {
-        if (!seen.Add(Key(a, b))) return;
-        Vec3 p; double cost;
-        Evaluate(a, b, out p, out cost);
-        heap.Add(new Cand { Cost = cost, A = a, B = b, P = p });
     }
 
     void Evaluate(int a, int b, out Vec3 p, out double cost)
@@ -1136,7 +1413,9 @@ class Decimator
         vTris[b].Clear();
         vDead[b] = true;
 
-        // Costs around the merged vertex are now stale - re-push its edges.
+        // Everything referencing the merged vertex is now stale; bump its
+        // stamp so old heap entries die on pop, then push fresh candidates.
+        stamp[a]++;
         HashSet<int> nbr = new HashSet<int>();
         foreach (int f in vTris[a])
         {
@@ -1151,7 +1430,7 @@ class Decimator
         {
             Vec3 np; double nc;
             Evaluate(a, v, out np, out nc);
-            Push(new Cand { Cost = nc, A = a, B = v, P = np });
+            Push(nc, a, v);
         }
     }
 
@@ -1174,43 +1453,40 @@ class Decimator
         return m;
     }
 
-    // ---- binary heap (min by Cost) ----
-    void Heapify() { for (int i = heap.Count / 2 - 1; i >= 0; i--) SiftDown(i); }
-
-    void Push(Cand c) { heap.Add(c); SiftUp(heap.Count - 1); }
-
-    Cand Pop()
+    // ---- binary heap (min by Cost), flat struct array, hole sift ----
+    void Push(double cost, int a, int b)
     {
-        if (heap.Count == 0) return null;
-        Cand top = heap[0];
-        heap[0] = heap[heap.Count - 1];
-        heap.RemoveAt(heap.Count - 1);
-        if (heap.Count > 0) SiftDown(0);
-        return top;
-    }
-
-    void SiftUp(int i)
-    {
+        if (heapN == heap.Length) Array.Resize(ref heap, heap.Length * 2);
+        Cand c;
+        c.Cost = cost; c.A = a; c.B = b; c.SA = stamp[a]; c.SB = stamp[b];
+        int i = heapN++;
         while (i > 0)
         {
-            int p = (i - 1) / 2;
-            if (heap[p].Cost <= heap[i].Cost) break;
-            Cand t = heap[p]; heap[p] = heap[i]; heap[i] = t;
+            int p = (i - 1) >> 1;
+            if (heap[p].Cost <= cost) break;
+            heap[i] = heap[p];
             i = p;
         }
+        heap[i] = c;
     }
 
-    void SiftDown(int i)
+    bool Pop(out Cand top)
     {
-        while (true)
+        if (heapN == 0) { top = default(Cand); return false; }
+        top = heap[0];
+        Cand last = heap[--heapN];
+        if (heapN == 0) return true;
+        int i = 0, half = heapN >> 1;
+        while (i < half)
         {
-            int l = 2 * i + 1, r = l + 1, s = i;
-            if (l < heap.Count && heap[l].Cost < heap[s].Cost) s = l;
-            if (r < heap.Count && heap[r].Cost < heap[s].Cost) s = r;
-            if (s == i) break;
-            Cand t = heap[s]; heap[s] = heap[i]; heap[i] = t;
+            int l = 2 * i + 1, r = l + 1, s = l;
+            if (r < heapN && heap[r].Cost < heap[l].Cost) s = r;
+            if (heap[s].Cost >= last.Cost) break;
+            heap[i] = heap[s];
             i = s;
         }
+        heap[i] = last;
+        return true;
     }
 }
 
@@ -1234,7 +1510,14 @@ static class Program
         bool probe = false;
         bool ascii = false;
         string progressFile = null;
-        double coarse = 0.10;
+        // Coarse pre-weld default is OFF: with the sorted edge census and the
+        // stamp-invalidated heap, full quadric decimation does 1.26M -> 19.5k
+        // in ~6s, stays CLOSED, and is 2-4x more accurate. Vertex clustering
+        // (coarse > 0) tears thin features into unclosable rims - keep it only
+        // as an emergency lever for absurdly dense meshes.
+        double coarse = 0;
+        double weldCapMM = 0.35;       // absolute ceiling on the coarse weld tolerance, in mm; 0 = only the diagonal-relative cap
+        bool repairHoles = true;
         int topoCheckLimit = 400000;
         double speckFraction = 0.01;   // drop shells smaller than this fraction of the model diagonal
         bool pruneShells = true;
@@ -1268,6 +1551,8 @@ static class Program
             else if (a == "--ascii") ascii = true;
             else if (a == "--progress-file" && i + 1 < args.Length) progressFile = args[++i];
             else if (a == "--coarse" && i + 1 < args.Length) coarse = double.Parse(args[++i], CultureInfo.InvariantCulture);
+            else if (a == "--weld-cap" && i + 1 < args.Length) weldCapMM = double.Parse(args[++i], CultureInfo.InvariantCulture);
+            else if (a == "--no-repair") repairHoles = false;
             else if (a == "--no-prune") pruneShells = false;
             else if (a == "--cut-below-attach") cutBelowAttach = true;
             else if (a == "--topo-limit" && i + 1 < args.Length) topoCheckLimit = int.Parse(args[++i], CultureInfo.InvariantCulture);
@@ -1353,6 +1638,7 @@ static class Program
             Prog.SetNow("pruning unreachable shells");
             int beforePrune = mesh.TriangleCount;
             mesh = Shells.Prune(mesh, speckFraction, out speckShells, out voidShells);
+            Prog.SetNow("pruned (" + mesh.TriangleCount + " triangles left)");
             if (mesh.TriangleCount != beforePrune) soup = mesh;   // coarse passes re-weld from the pruned mesh
         }
 
@@ -1393,6 +1679,15 @@ static class Program
             int coarseTarget = maxTris * 8;
             double targetEdge = diag / Math.Sqrt((double)coarseTarget);
             double cap = diag * 5e-3;
+            // Above ~0.35mm the clustering starts merging opposite walls of
+            // thin machined features (scallops, webs) and tears the closure
+            // faster than hole repair can hide, so cap the tolerance absolutely
+            // and let decimation carry the rest of the reduction.
+            if (weldCapMM > 0)
+            {
+                double capU = (stlUnits == "in") ? weldCapMM / 25.4 : weldCapMM;
+                if (capU < cap) cap = capU;
+            }
             weldTol = Math.Max(weldTol, Math.Min(targetEdge * coarse, cap));
             Prog.SetNow("coarse weld (" + mesh.TriangleCount + " triangles)");
             mesh = Weld.Run(soup, weldTol, true);
@@ -1407,6 +1702,23 @@ static class Program
             }
         }
         int vertsWelded = mesh.Verts.Count;
+
+        // Repair BEFORE decimation: the coarse weld is what tears holes, and a
+        // closed mesh going into the decimator stays closed (the link condition
+        // rejects collapses that would break it). Repairing here also fixes
+        // exports that arrived with holes.
+        int holesFilled = 0, fillTriangles = 0;
+        List<string> repairWarn = new List<string>();
+        if (repairHoles)
+        {
+            Prog.SetNow("checking topology (" + mesh.TriangleCount + " triangles)");
+            Topo.Report pre = Topo.Check(mesh);
+            if (pre.Boundary > 0)
+            {
+                Prog.SetNow("repairing " + pre.Boundary + " hole edge(s)");
+                HoleFill.Run(mesh, ref holesFilled, ref fillTriangles, repairWarn);
+            }
+        }
 
         double deviation = 0;
         bool decimated = false;
@@ -1423,12 +1735,33 @@ static class Program
         // connectivity, so this is the final topology.
         Topo.Report topoOut = Topo.Check(mesh);
 
+        // Safety net: if decimation still exposed a hole, fill it and, if the
+        // fill pushed the count over budget, decimate the little excess away
+        // and re-check. Bounded to one extra round.
+        if (repairHoles && topoOut.Boundary > 0)
+        {
+            Prog.SetNow("repairing " + topoOut.Boundary + " hole edge(s) after decimation");
+            HoleFill.Run(mesh, ref holesFilled, ref fillTriangles, repairWarn);
+            if (maxTris > 0 && mesh.TriangleCount > maxTris)
+            {
+                Prog.SetNow("re-decimating " + mesh.TriangleCount + " -> " + maxTris);
+                Decimator d2 = new Decimator();
+                d2.PreserveExtents = preserveExtents;
+                double dev2;
+                mesh = d2.Run(mesh, maxTris, out dev2);
+                if (dev2 > deviation) deviation = dev2;
+                HoleFill.Run(mesh, ref holesFilled, ref fillTriangles, repairWarn);
+            }
+            topoOut = Topo.Check(mesh);
+        }
+
         // ---- shrink about the attach point ----
         double sx = 1, sy = 1, sz = 1;
         int vertsBelowAnchor = 0;
         bool scaled = false;
         List<string> warn = new List<string>();
         foreach (string w in cutWarn) warn.Add(w);
+        foreach (string w in repairWarn) warn.Add(w);
 
         if (topoIn != null && !topoIn.Closed)
         {
@@ -1442,10 +1775,16 @@ static class Program
         {
             warn.Add("processing degraded topology: in=" + topoIn.Text() + ", out=" + topoOut.Text());
         }
+        if (decimated && maxTris > 0 && mesh.TriangleCount > maxTris)
+        {
+            warn.Add("triangle budget missed: " + mesh.TriangleCount + " > " + maxTris +
+                     " (topology constraints pinned too many vertices)");
+        }
         if (!topoOut.Closed)
         {
-            warn.Add("output mesh is " + topoOut.Text() + " - the control expects a closed mesh." +
-                     " Re-run with --coarse 0 to keep it closed (much slower on dense meshes).");
+            warn.Add("output mesh is " + topoOut.Text() + " - the control expects a closed mesh" +
+                     (repairHoles ? " (hole repair could not close everything)." : "." +
+                      " Re-run without --no-repair, or with --coarse 0 (much slower on dense meshes)."));
         }
 
         if (clearMesh > 0)
@@ -1519,6 +1858,9 @@ static class Program
             sb.Append(",\"weldTol\":").Append(F(weldTol));
             sb.Append(",\"coarsePasses\":").Append(coarsePasses);
             sb.Append(",\"coarse\":").Append(F(coarse));
+            sb.Append(",\"weldCap\":").Append(F(weldCapMM));
+            sb.Append(",\"holesFilled\":").Append(holesFilled);
+            sb.Append(",\"fillTriangles\":").Append(fillTriangles);
             sb.Append(",\"topologyIn\":").Append(topoIn == null ? "null" : topoIn.Json());
             sb.Append(",\"topologyOut\":").Append(topoOut.Json());
             sb.Append(",\"cutBelowAttach\":").Append(didCut ? "true" : "false");
@@ -1617,6 +1959,9 @@ static class Program
         Console.Error.WriteLine("                   is always mm and is converted to match.");
         Console.Error.WriteLine("  --probe          report as-read bounds only; write nothing");
         Console.Error.WriteLine("  --cut-below-attach  remove everything below the attach plane and cap the hole");
+        Console.Error.WriteLine("  --weld-cap MM    absolute ceiling on the coarse weld tolerance, in mm");
+        Console.Error.WriteLine("                   (default 0.35; 0 = only the diagonal-relative cap)");
+        Console.Error.WriteLine("  --no-repair      do not fill holes left by processing or by the export");
         Console.Error.WriteLine("  --progress-file F  write a one-line status to F while working");
         Console.Error.WriteLine("  --ascii          write ASCII STL instead of binary. Required for the TNC 640:");
         Console.Error.WriteLine("                   it rejects long runs of bytes with no line break on PUT.");

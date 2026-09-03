@@ -270,6 +270,29 @@ check("sides in 1.5", abs(bb[0] + 13.5) < 1e-3 and abs(bb[3] - 13.5) < 1e-3, str
 check("top down 1.5", abs(bb[5] - 8.5) < 1e-3, str(bb))
 check("still closed", r["topologyOut"]["closed"] is True, so)
 
+print("== TEST 18: hole repair closes an open mesh by default ==")
+# box with two triangles removed: a hole in the top face and one in a side
+st18 = os.path.join(D, "rep18.stl"); st18o = os.path.join(D, "rep18_out.stl")
+t18 = box(-10,-10,0, 10,10,20)
+del t18[3]   # top face triangle
+del t18[6]   # side face triangle
+write_binary_stl(st18, t18)
+rc, so, se = run([st18, st18o, "--max-tris", "0"])
+check("exit 0", rc == 0, se)
+r = json.loads(so)
+check("input open", r["topologyIn"]["closed"] is False, so)
+check("repair filled loops", r["holesFilled"] >= 1, so)
+check("output closed", r["topologyOut"]["closed"] is True and r["topologyOut"]["holes"] == 0, so)
+check("bbox unchanged", bbox(read_binary_stl(st18o)) == (-10.0,-10.0,0.0,10.0,10.0,20.0), so)
+
+print("== TEST 19: --no-repair leaves the export's holes alone and warns ==")
+rc, so, se = run([st18, st18o, "--max-tris", "0", "--no-repair"])
+check("exit 0", rc == 0, se)
+r = json.loads(so)
+check("nothing filled", r["holesFilled"] == 0, so)
+check("output still open", r["topologyOut"]["closed"] is False, so)
+check("warns not closed", any("NOT closed" in w for w in r["warnings"]), so)
+
 print()
 print("FAILURES: " + (", ".join(fails) if fails else "none"))
 sys.exit(1 if fails else 0)

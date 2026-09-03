@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.9.1
+  Version: 1.10.0
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -203,20 +203,34 @@ $StlAsciiOutput    = $true
 $StlPrepTimeoutSeconds = 600
 
 # Coarse pre-weld aggressiveness for very dense meshes (fraction of the target
-# edge length). This is a correctness/speed dial, so it is worth knowing what
-# it costs. Measured on a 1.66M-triangle in-process stock mesh:
+# edge length). 0 = OFF (default): full quadric decimation handles even huge
+# meshes directly now. Measured on the 1.26M-triangle in-process stock that
+# used to need the pre-weld:
 #
-#   0.10 (default)  ~5s      creates ~2700 holes - NOT closed
-#   0               ~38min   stays closed, 0 holes, and 3x more accurate
+#   0 (default)   ~6s    closed (watertight), deviation 0.44mm, exact bbox
+#   0.10          ~76s   torn: hundreds of hole edges the repair cannot chain
 #
-# The pre-weld is vertex clustering, which cannot preserve closure at this
-# reduction ratio. It only engages above 8x the triangle budget, so fixtures
-# and part meshes never take this path - they are always closed and accurate.
-# Only dense in-process stock is affected, and that is display-only geometry.
+# (The old "38 minutes without the pre-weld" was never the decimation math -
+# it was Dictionary hash collisions on packed edge keys; fixed by a sorted
+# edge census. The pre-weld is vertex clustering, which tears thin machined
+# features into rims with inconsistent winding - unclosable even by repair.)
 #
-# Set to 0 if the control rejects a torn stock mesh, and raise
-# $StlPrepTimeoutSeconds well above the expected runtime or it will be killed.
-$StlCoarseFactor = 0.10
+# Leave at 0. Raise only as an emergency lever if some absurd mesh ever
+# exhausts $StlPrepTimeoutSeconds, and expect hole warnings when you do.
+$StlCoarseFactor = 0
+
+# Absolute ceiling on the coarse weld tolerance, in mm. The relative cap alone
+# let the tolerance climb past 1mm on a dense in-process stock, which merged
+# opposite walls of thin machined features and tore thousands of holes. 0.35mm
+# keeps the clustering below typical scallop size; decimation carries the rest
+# of the reduction (slower, but accurate and far less torn). 0 = relative cap
+# only (the old behaviour).
+$StlWeldCapMM = 0.35
+
+# Fill any holes the mesh has after processing (and any it arrived with) so the
+# output is CLOSED, which the control requires. Chained boundary edges are
+# capped with triangles; crude but far below visual scale.
+$StlRepairHoles = $true
 
 # How often to echo the converter's current stage to the log while it works.
 $StlProgressIntervalSeconds = 10
@@ -357,6 +371,8 @@ if (Test-Path $ConfigFile) {
         if ($cfg.ToolTableTransferMode)  { $ToolTableTransferMode  = [string]$cfg.ToolTableTransferMode }
         if ($cfg.ToolTableFolder)        { $ToolTableFolder        = [string]$cfg.ToolTableFolder }
         if ($null -ne $cfg.StlCoarseFactor)       { $StlCoarseFactor       = [double]$cfg.StlCoarseFactor }
+        if ($null -ne $cfg.StlWeldCapMM)          { $StlWeldCapMM          = [double]$cfg.StlWeldCapMM }
+        if ($null -ne $cfg.StlRepairHoles)        { $StlRepairHoles        = [bool]$cfg.StlRepairHoles }
         if ($null -ne $cfg.StlPrepTimeoutSeconds) { $StlPrepTimeoutSeconds = [int]$cfg.StlPrepTimeoutSeconds }
         if ($null -ne $cfg.FixtureClearanceMM)     { $FixtureClearanceMM     = [double]$cfg.FixtureClearanceMM }
         if ($null -ne $cfg.NcSettleDelaySeconds)   { $NcSettleDelaySeconds   = [int]$cfg.NcSettleDelaySeconds }
@@ -1573,7 +1589,9 @@ function Send-StlBundle {
             }
 
             $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits,
-                          "--coarse", ([string]$StlCoarseFactor))
+                          "--coarse", ([string]$StlCoarseFactor),
+                          "--weld-cap", ([string]$StlWeldCapMM))
+            if (-not $StlRepairHoles) { $prepArgs += "--no-repair" }
             if ($StlAsciiOutput) { $prepArgs += "--ascii" }
 
             if ($role -eq "FIXTURE") {
@@ -1608,6 +1626,10 @@ function Send-StlBundle {
                 Write-Log ("    {0} topology: {1}, holes {2}, non-manifold {3}" -f `
                     $role, $(if ($t.closed) { "closed (watertight)" } else { "NOT CLOSED" }), $t.holes, $t.nonManifold) `
                     $(if ($t.closed) { "DEBUG" } else { "WARNING" })
+            }
+            if ($rep.holesFilled -gt 0) {
+                Write-Log ("    {0}: repaired {1} hole loop(s) with {2} fill triangle(s)" -f `
+                    $role, $rep.holesFilled, $rep.fillTriangles) "DEBUG"
             }
             foreach ($w in @($rep.warnings)) { if ($w) { Write-Log "  STL PREP: $w" "WARNING" } }
             Write-Log ("  {0}: {1} -> {2} triangles (deviation {3} {4}){5}" -f `
@@ -2243,7 +2265,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.9.1"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.10.0"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
@@ -2258,7 +2280,7 @@ function Start-FolderWatcher {
     Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] + folder '$ToolTableFolder' -> $ToolTableDestination (mode: $ToolTableTransferMode)"
     Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
     Write-Log "Ignore Junk:     $(if ($IgnoreSystemFiles) { 'on (system/hidden files silently skipped)' } else { 'off' })"
-    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, cut below attach $(if ($FixtureCutBelowAttach) { 'on' } else { 'off' }), $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
+    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, cut below attach $(if ($FixtureCutBelowAttach) { 'on' } else { 'off' }), weld cap ${StlWeldCapMM}mm, repair $(if ($StlRepairHoles) { 'on' } else { 'off' }), $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
     Write-Log "NC Settle:       stable ${NcStableSeconds}s + sidecar grace ${NcSettleDelaySeconds}s, subfolder check $(if ($StlUseSubfolderSidecarCheck) { 'on' } else { 'off' }), remote stray cleanup $(if ($CleanupRemoteStray) { 'on' } else { 'off' })"
     Write-Log "=============================================="
     

@@ -31,3 +31,10 @@ service/*
 !service/stl-timing-test.ps1
 !service/stl-quality.py
 !service/stl-watertight.py
+
+# Critical technical documentation
+!docs/
+docs/*
+!docs/CRITICAL-CONSTRAINTS.md
+!docs/STL-PIPELINE.md
+!docs/WATCHER-BEHAVIOR.md
