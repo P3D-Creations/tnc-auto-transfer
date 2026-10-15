@@ -11,8 +11,19 @@ Defense layers:
 1. **Size stability**: `$NcStableSeconds` (8) of unchanged size before any NC
    file is processed; a growing file resets the clock.
 2. **Sidecar grace**: `$NcSettleDelaySeconds` (15) after stability, extended
-   while a subfolder named like the program stem exists (cap 12s extra), so
-   the sidecar structure has time to appear.
+   while a subfolder named like the program stem exists AND its contents are
+   still changing (file count + total size + newest write time signature).
+   The first two extensions are granted without activity, covering the gap
+   between the post creating the folder and the first slow mesh write. A
+   folder that sits unchanged through a whole grace period is a leftover
+   shell, not an export: the program ships as standalone (cap 12 extensions
+   for active exports). Without the activity test, every NC file posted
+   WITHOUT STLs stalled for the full 12 extensions whenever a same-named
+   folder lingered.
+   Emptied program subfolders are pruned: by `Move-ProcessedFile` after the
+   last file moves out (never the watch root, Processed, Failed or the tool
+   table tree), and at the standalone decision for a stale empty stem folder.
+   Regression harness: `service/stl-standalone-test.ps1`.
 3. **Structural checks**: `Test-TransientNcCopy` / `Test-NcAuthoritative` —
    a root-level program whose stem-named subfolder holds the authoritative
    copy is skipped (and later retired).

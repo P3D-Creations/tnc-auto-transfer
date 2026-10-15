@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.11.0
+  Version: 1.11.1
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -1011,6 +1011,29 @@ function Move-ProcessedFile {
             Write-Log "Moved to Failed folder: $relativePath" "ERROR"
         }
     }
+
+    # Prune the now-emptied program subfolder(s). A leftover stem-named folder
+    # makes every later same-named program look like a pending STL export and
+    # stalls it in sidecar grace for minutes. Climbs upward removing only
+    # genuinely empty folders strictly below the watch root; never touches the
+    # watch root, Processed, Failed or the tool table tree.
+    try {
+        $keep = @((Join-Path $WatchFolder 'Processed'),
+                  (Join-Path $WatchFolder 'Failed'),
+                  $ToolTableFolder,
+                  $ToolTableBackupFolder) | ForEach-Object { $_.TrimEnd('\', '/') }
+        $dir = [System.IO.Path]::GetDirectoryName($FilePath)
+        while ($dir) {
+            $d = $dir.TrimEnd('\', '/')
+            if ($d.Length -le $watchBase.Length) { break }
+            if (-not $d.StartsWith($watchBase, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+            if (@($keep | Where-Object { $_ -ieq $d }).Count -gt 0) { break }
+            if (@(Get-ChildItem -LiteralPath $dir -Force -ErrorAction Stop).Count -gt 0) { break }
+            Remove-Item -LiteralPath $dir -Force -ErrorAction Stop
+            Write-Log "Removed emptied program subfolder: $($d.Substring($watchBase.Length + 1))" "DEBUG"
+            $dir = [System.IO.Path]::GetDirectoryName($dir)
+        }
+    } catch {}
 }
 
 function New-RemoteDirectory {
@@ -1872,6 +1895,7 @@ function Process-SingleFile {
             $lastChange = Get-Date
             $graceUntil = $null
             $graceExtensions = 0
+            $stemSig = $null
             $lastHeartbeat = Get-Date
 
             while ($true) {
@@ -1903,17 +1927,51 @@ function Process-SingleFile {
                         $graceUntil = (Get-Date).AddSeconds($NcSettleDelaySeconds)
                     }
                     elseif ((Get-Date) -ge $graceUntil) {
-                        # If the stem-named program subfolder exists, the post
-                        # is mid-export (meshes still copying) - keep waiting
-                        # instead of racing it. Bounded so an unrelated folder
-                        # with the same name cannot block a program forever.
+                        # If the stem-named program subfolder exists AND its
+                        # contents are still changing, the post is mid-export
+                        # (meshes still copying) - keep waiting instead of
+                        # racing it. A folder that sits UNCHANGED through a
+                        # whole grace period is just the leftover shell of an
+                        # earlier run (Processed moves files, not folders), so
+                        # a program posted without STLs must not stall on it.
+                        # The first two extensions are granted without activity
+                        # to cover the gap between the post creating the folder
+                        # and the first (possibly slow) mesh write starting.
                         $stemDir = Join-Path ([System.IO.Path]::GetDirectoryName($FilePath)) ([System.IO.Path]::GetFileNameWithoutExtension($FilePath))
+                        $extend = $false
                         if ($StlUseSubfolderSidecarCheck -and $graceExtensions -lt 12 -and (Test-Path $stemDir)) {
-                            $graceExtensions++
-                            $graceUntil = (Get-Date).AddSeconds($NcSettleDelaySeconds)
-                            Write-Log "Subfolder '$([System.IO.Path]::GetFileNameWithoutExtension($FilePath))' exists; extending sidecar grace for $fileName ($graceExtensions)" "DEBUG"
+                            $sig = ""
+                            try {
+                                $items = @(Get-ChildItem -LiteralPath $stemDir -File -Recurse -Force -ErrorAction Stop)
+                                $sum = ($items | Measure-Object Length -Sum).Sum
+                                $newest = ($items | Measure-Object LastWriteTimeUtc -Maximum).Maximum
+                                $sig = "{0}|{1}|{2:o}" -f $items.Count, $sum, $newest
+                            } catch {}
+                            $active = ($sig -ne $stemSig)
+                            $stemSig = $sig
+                            if ($active -or $graceExtensions -lt 2) {
+                                $extend = $true
+                                $graceExtensions++
+                                $graceUntil = (Get-Date).AddSeconds($NcSettleDelaySeconds)
+                                Write-Log ("Subfolder '{0}' {1}; extending sidecar grace for {2} ({3})" -f `
+                                    [System.IO.Path]::GetFileNameWithoutExtension($FilePath), `
+                                    $(if ($active) { "is still being written" } else { "exists" }), $fileName, $graceExtensions) "DEBUG"
+                            }
+                            elseif (-not $active) {
+                                Write-Log "Subfolder '$([System.IO.Path]::GetFileNameWithoutExtension($FilePath))' is idle - treating $fileName as a standalone program." "DEBUG"
+                                # An idle EMPTY stem folder is the shell of an
+                                # earlier run; remove it or it stalls the next
+                                # same-named post too. Only after the activity
+                                # window proved nothing is writing into it.
+                                try {
+                                    if (@(Get-ChildItem -LiteralPath $stemDir -Force -ErrorAction Stop).Count -eq 0) {
+                                        Remove-Item -LiteralPath $stemDir -Force -ErrorAction Stop
+                                        Write-Log "Removed stale empty program subfolder: $([System.IO.Path]::GetFileNameWithoutExtension($FilePath))" "DEBUG"
+                                    }
+                                } catch {}
+                            }
                         }
-                        else { break }   # genuinely a standalone program - send it
+                        if (-not $extend) { break }   # genuinely a standalone program - send it
                     }
                 }
                 elseif (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 30) {
@@ -2280,7 +2338,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.11.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.11.1"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"

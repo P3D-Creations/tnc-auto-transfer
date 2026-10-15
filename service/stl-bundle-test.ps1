@@ -56,4 +56,5 @@ if ($mode -eq 'layoutA') {
 Write-Host "--- send order ---" -ForegroundColor Yellow
 $i=1; foreach ($s in $script:Sent) { "  $i. $($s.File)"; $i++ }
 Write-Host "--- leftovers in watch folder (should be empty) ---" -ForegroundColor Yellow
-Get-ChildItem $f -File | ForEach-Object { "  LEFT: $($_.Name)" }
+if (Test-Path $f) { Get-ChildItem $f -File | ForEach-Object { "  LEFT: $($_.Name)" } }
+else { Write-Host "  (program subfolder pruned after retiring - nothing left)" }
