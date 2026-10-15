@@ -2,7 +2,7 @@
 <#
 ================================================================================
   TNCcmd Folder Watcher
-  Version: 1.10.0
+  Version: 1.11.0
   Date:    2026-07-02
   Author:  Xander Luciano
   Docs:    https://notes.xanderluciano.com/heidenhain-tnccmd-auto-transfer
@@ -232,6 +232,13 @@ $StlWeldCapMM = 0.35
 # capped with triangles; crude but far below visual scale.
 $StlRepairHoles = $true
 
+# A fixture made of several bodies exports with mating faces exactly
+# coincident; after decimation they interpenetrate by micrometres and the
+# control rejects the mesh ("does not fulfill the quality requirements").
+# Micro-shrink every separate shell about its own centroid so contact becomes
+# a clean gap. Invisible next to the 1.5mm clearance. 0 = off.
+$StlShellGapMM = 0.03
+
 # How often to echo the converter's current stage to the log while it works.
 $StlProgressIntervalSeconds = 10
 
@@ -373,6 +380,7 @@ if (Test-Path $ConfigFile) {
         if ($null -ne $cfg.StlCoarseFactor)       { $StlCoarseFactor       = [double]$cfg.StlCoarseFactor }
         if ($null -ne $cfg.StlWeldCapMM)          { $StlWeldCapMM          = [double]$cfg.StlWeldCapMM }
         if ($null -ne $cfg.StlRepairHoles)        { $StlRepairHoles        = [bool]$cfg.StlRepairHoles }
+        if ($null -ne $cfg.StlShellGapMM)         { $StlShellGapMM         = [double]$cfg.StlShellGapMM }
         if ($null -ne $cfg.StlPrepTimeoutSeconds) { $StlPrepTimeoutSeconds = [int]$cfg.StlPrepTimeoutSeconds }
         if ($null -ne $cfg.FixtureClearanceMM)     { $FixtureClearanceMM     = [double]$cfg.FixtureClearanceMM }
         if ($null -ne $cfg.NcSettleDelaySeconds)   { $NcSettleDelaySeconds   = [int]$cfg.NcSettleDelaySeconds }
@@ -1590,7 +1598,8 @@ function Send-StlBundle {
 
             $prepArgs = @("--max-tris", "$StlMaxTriangles", "--stl-units", $stlUnits,
                           "--coarse", ([string]$StlCoarseFactor),
-                          "--weld-cap", ([string]$StlWeldCapMM))
+                          "--weld-cap", ([string]$StlWeldCapMM),
+                          "--shell-gap", ([string]$StlShellGapMM))
             if (-not $StlRepairHoles) { $prepArgs += "--no-repair" }
             if ($StlAsciiOutput) { $prepArgs += "--ascii" }
 
@@ -1623,13 +1632,19 @@ function Send-StlBundle {
 
             if ($rep.topologyOut) {
                 $t = $rep.topologyOut
-                Write-Log ("    {0} topology: {1}, holes {2}, non-manifold {3}" -f `
-                    $role, $(if ($t.closed) { "closed (watertight)" } else { "NOT CLOSED" }), $t.holes, $t.nonManifold) `
-                    $(if ($t.closed) { "DEBUG" } else { "WARNING" })
+                $folded = if ($null -ne $t.misoriented) { [int]$t.misoriented } else { 0 }
+                $ok = $t.closed -and ($folded -eq 0)
+                Write-Log ("    {0} topology: {1}, holes {2}, non-manifold {3}, folded {4}" -f `
+                    $role, $(if ($t.closed) { "closed (watertight)" } else { "NOT CLOSED" }), $t.holes, $t.nonManifold, $folded) `
+                    $(if ($ok) { "DEBUG" } else { "WARNING" })
             }
             if ($rep.holesFilled -gt 0) {
                 Write-Log ("    {0}: repaired {1} hole loop(s) with {2} fill triangle(s)" -f `
                     $role, $rep.holesFilled, $rep.fillTriangles) "DEBUG"
+            }
+            if ($rep.shellsSeparated -gt 1) {
+                Write-Log ("    {0}: {1} separate bodies micro-separated by {2}mm so mating faces cannot interpenetrate" -f `
+                    $role, $rep.shellsSeparated, $rep.shellGap) "DEBUG"
             }
             foreach ($w in @($rep.warnings)) { if ($w) { Write-Log "  STL PREP: $w" "WARNING" } }
             Write-Log ("  {0}: {1} -> {2} triangles (deviation {3} {4}){5}" -f `
@@ -2265,7 +2280,7 @@ function Start-FolderWatcher {
     #>
     
     Write-Log "=============================================="
-    Write-Log "Heidenhain TNCcmd Folder Watcher v1.10.0"
+    Write-Log "Heidenhain TNCcmd Folder Watcher v1.11.0"
     Write-Log "=============================================="
     if ($ConfigOverridesActive) {
         Write-Log "Config File:     $ConfigFile (overrides active)"
@@ -2280,7 +2295,7 @@ function Start-FolderWatcher {
     Write-Log "Tool Tables:     [$($ToolTableFiles -join ', ')] + folder '$ToolTableFolder' -> $ToolTableDestination (mode: $ToolTableTransferMode)"
     Write-Log "Tool Backups:    $ToolTableBackupCount kept in '$ToolTableBackupFolder'"
     Write-Log "Ignore Junk:     $(if ($IgnoreSystemFiles) { 'on (system/hidden files silently skipped)' } else { 'off' })"
-    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, cut below attach $(if ($FixtureCutBelowAttach) { 'on' } else { 'off' }), weld cap ${StlWeldCapMM}mm, repair $(if ($StlRepairHoles) { 'on' } else { 'off' }), $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
+    Write-Log "STL Transfer:    $(if ($EnableStlTransfer) { "on (max $StlMaxTriangles tris, fixture shrink ${FixtureClearanceMM}mm/face, cut below attach $(if ($FixtureCutBelowAttach) { 'on' } else { 'off' }), weld cap ${StlWeldCapMM}mm, repair $(if ($StlRepairHoles) { 'on' } else { 'off' }), shell gap ${StlShellGapMM}mm, $(if ($StlAsciiOutput) {'ASCII'} else {'binary'}))" } else { 'off' })"
     Write-Log "NC Settle:       stable ${NcStableSeconds}s + sidecar grace ${NcSettleDelaySeconds}s, subfolder check $(if ($StlUseSubfolderSidecarCheck) { 'on' } else { 'off' }), remote stray cleanup $(if ($CleanupRemoteStray) { 'on' } else { 'off' })"
     Write-Log "=============================================="
     

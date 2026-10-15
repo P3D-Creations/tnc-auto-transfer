@@ -247,26 +247,33 @@ static class Topo
     public class Report
     {
         public int Boundary, NonManifold, Degenerate, Triangles;
+        // Edges shared by exactly two faces wound the SAME way: the surface is
+        // folded onto itself there. Edge-use counts alone cannot see it, and
+        // the control's import quality check rejects meshes over exactly this.
+        public int Misoriented;
         // Watertight/closed means no boundary edges: the surface bounds a
         // volume. Non-manifold edges are a separate, lesser condition - two
         // shells meeting along a seam is still closed, and Fusion exports
         // arrive that way - so they are reported but do not clear this flag.
         public bool Closed { get { return Boundary == 0 && Degenerate == 0; } }
         public bool Manifold { get { return NonManifold == 0; } }
+        public bool Oriented { get { return Misoriented == 0; } }
         public string Json()
         {
             return "{\"closed\":" + (Closed ? "true" : "false") +
                    ",\"manifold\":" + (Manifold ? "true" : "false") +
                    ",\"holes\":" + Boundary +
                    ",\"nonManifold\":" + NonManifold +
+                   ",\"misoriented\":" + Misoriented +
                    ",\"degenerate\":" + Degenerate + "}";
         }
         public string Text()
         {
-            if (Closed && Manifold) return "watertight and manifold";
-            if (Closed) return "closed (watertight), " + NonManifold + " non-manifold edge(s)";
+            string fold = Oriented ? "" : ", " + Misoriented + " FOLDED edge(s)";
+            if (Closed && Manifold) return "watertight and manifold" + fold;
+            if (Closed) return "closed (watertight), " + NonManifold + " non-manifold edge(s)" + fold;
             return "NOT closed - " + Boundary + " hole edge(s), " + NonManifold +
-                   " non-manifold, " + Degenerate + " degenerate";
+                   " non-manifold, " + Degenerate + " degenerate" + fold;
         }
     }
 
@@ -280,14 +287,17 @@ static class Topo
         Report r = new Report();
         r.Triangles = m.TriangleCount;
         long[] keys = new long[m.Tris.Count];
+        byte[] fwd = new byte[m.Tris.Count];   // 1 when the directed edge runs lo->hi
         int n = 0;
         for (int t = 0; t < m.Tris.Count; t += 3)
         {
             int a = m.Tris[t], b = m.Tris[t + 1], c = m.Tris[t + 2];
             if (a == b || b == c || a == c) { r.Degenerate++; continue; }
-            keys[n++] = Pack(a, b); keys[n++] = Pack(b, c); keys[n++] = Pack(c, a);
+            keys[n] = Pack(a, b); fwd[n] = (byte)(a < b ? 1 : 0); n++;
+            keys[n] = Pack(b, c); fwd[n] = (byte)(b < c ? 1 : 0); n++;
+            keys[n] = Pack(c, a); fwd[n] = (byte)(c < a ? 1 : 0); n++;
         }
-        Array.Sort(keys, 0, n);
+        Array.Sort(keys, fwd, 0, n);
         int i = 0;
         while (i < n)
         {
@@ -296,6 +306,7 @@ static class Topo
             int cnt = j - i;
             if (cnt == 1) r.Boundary++;
             else if (cnt > 2) r.NonManifold++;
+            else if (fwd[i] == fwd[i + 1]) r.Misoriented++;   // two faces, same direction
             i = j;
         }
         return r;
@@ -615,7 +626,13 @@ static class PlaneCut
 
             capLoops++;
             int before = outM.Tris.Count;
-            Triangulate(outM, loop, warn);
+            // The loop was walked opposite to the surface winding, so emitting
+            // it in ORDER gives the topologically correct cap orientation for
+            // outer rims AND hole rims alike. (Choosing the winding from the
+            // XY area sign - "caps face down" - was wrong for hole rims: the
+            // cap over a vacuum-hole tube came out folded against its walls,
+            // and the control rejected the mesh over exactly those edges.)
+            HoleFill.FillLoop(outM, loop);
             capTris += (outM.Tris.Count - before) / 3;
         }
 
@@ -660,81 +677,10 @@ static class PlaneCut
         return ((long)lo << 32) | (uint)hi;
     }
 
-    // Ear clipping in the XY plane; falls back to a centroid fan when no ear
-    // can be found (degenerate rims), which still closes the hole.
-    static void Triangulate(Mesh m, List<int> loop, List<string> warn)
-    {
-        List<int> v = new List<int>(loop);
-
-        double area = 0;
-        for (int i = 0; i < v.Count; i++)
-        {
-            Vec3 p = m.Verts[v[i]], q = m.Verts[v[(i + 1) % v.Count]];
-            area += p.X * q.Y - q.X * p.Y;
-        }
-        // Emit with the cap facing DOWN (-Z, outward from the solid above):
-        // a loop that is CCW in XY fans into +Z normals, so reverse it.
-        if (area > 0) v.Reverse();
-
-        int guard = v.Count * v.Count + 16;
-        while (v.Count > 3 && guard-- > 0)
-        {
-            bool clipped = false;
-            for (int i = 0; i < v.Count; i++)
-            {
-                int ia = v[(i + v.Count - 1) % v.Count], ib = v[i], ic = v[(i + 1) % v.Count];
-                Vec3 a = m.Verts[ia], b = m.Verts[ib], c = m.Verts[ic];
-                double cross = (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X);
-                if (cross >= -1e-12) continue;   // reflex or collinear for CW winding
-
-                bool inside = false;
-                for (int j = 0; j < v.Count; j++)
-                {
-                    if (v[j] == ia || v[j] == ib || v[j] == ic) continue;
-                    if (PointInTri(m.Verts[v[j]], a, b, c)) { inside = true; break; }
-                }
-                if (inside) continue;
-
-                m.Tris.Add(ia); m.Tris.Add(ib); m.Tris.Add(ic);
-                v.RemoveAt(i);
-                clipped = true;
-                break;
-            }
-            if (!clipped) break;
-        }
-
-        if (v.Count == 3)
-        {
-            m.Tris.Add(v[0]); m.Tris.Add(v[1]); m.Tris.Add(v[2]);
-        }
-        else if (v.Count > 3)
-        {
-            // Centroid fan fallback: not pretty on concave rims, but closed.
-            warn.Add("plane cut: ear clipping stalled on a " + loop.Count + "-edge rim; capped with a centroid fan");
-            double cx = 0, cy = 0;
-            for (int i = 0; i < v.Count; i++) { cx += m.Verts[v[i]].X; cy += m.Verts[v[i]].Y; }
-            Vec3 centre = new Vec3(cx / v.Count, cy / v.Count, m.Verts[v[0]].Z);
-            int ci = m.Verts.Count;
-            m.Verts.Add(centre);
-            for (int i = 0; i < v.Count; i++)
-            {
-                m.Tris.Add(ci); m.Tris.Add(v[i]); m.Tris.Add(v[(i + 1) % v.Count]);
-            }
-        }
-    }
-
-    static bool PointInTri(Vec3 p, Vec3 a, Vec3 b, Vec3 c)
-    {
-        double d1 = Sign(p, a, b), d2 = Sign(p, b, c), d3 = Sign(p, c, a);
-        bool neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
-        bool pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
-        return !(neg && pos);
-    }
-
-    static double Sign(Vec3 p, Vec3 a, Vec3 b)
-    {
-        return (p.X - a.X) * (b.Y - a.Y) - (b.X - a.X) * (p.Y - a.Y);
-    }
+    // Caps are triangulated by HoleFill.FillLoop, which preserves the loop's
+    // topological order (walked opposite the surface winding above), so every
+    // cap opposes its rim correctly whether it closes an outer boundary or a
+    // hole tube.
 }
 
 // Exact identity of a triangle regardless of winding. A plain hash is not
@@ -950,8 +896,10 @@ static class HoleFill
     }
 
     // The loop's vertex ORDER is fixed by topology (it already opposes the
-    // surface winding), so unlike a planar cap it must never be reversed -
-    // the ear test adapts to the loop's own signed area instead.
+    // surface winding), so it must never be reversed - the ear test adapts to
+    // the loop's own signed area instead. Also used by PlaneCut for its caps.
+    public static void FillLoop(Mesh m, List<int> loop) { Fill(m, loop); }
+
     static void Fill(Mesh m, List<int> loop)
     {
         if (loop.Count == 3)
@@ -1517,6 +1465,7 @@ static class Program
         // as an emergency lever for absurdly dense meshes.
         double coarse = 0;
         double weldCapMM = 0.35;       // absolute ceiling on the coarse weld tolerance, in mm; 0 = only the diagonal-relative cap
+        double shellGapMM = 0.03;      // micro-shrink each separate shell so coincident faces become a clean gap; 0 = off
         bool repairHoles = true;
         int topoCheckLimit = 400000;
         double speckFraction = 0.01;   // drop shells smaller than this fraction of the model diagonal
@@ -1552,6 +1501,7 @@ static class Program
             else if (a == "--progress-file" && i + 1 < args.Length) progressFile = args[++i];
             else if (a == "--coarse" && i + 1 < args.Length) coarse = double.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--weld-cap" && i + 1 < args.Length) weldCapMM = double.Parse(args[++i], CultureInfo.InvariantCulture);
+            else if (a == "--shell-gap" && i + 1 < args.Length) shellGapMM = double.Parse(args[++i], CultureInfo.InvariantCulture);
             else if (a == "--no-repair") repairHoles = false;
             else if (a == "--no-prune") pruneShells = false;
             else if (a == "--cut-below-attach") cutBelowAttach = true;
@@ -1786,6 +1736,11 @@ static class Program
                      (repairHoles ? " (hole repair could not close everything)." : "." +
                       " Re-run without --no-repair, or with --coarse 0 (much slower on dense meshes)."));
         }
+        if (!topoOut.Oriented)
+        {
+            warn.Add("output mesh has " + topoOut.Misoriented + " folded (misoriented) edge(s) - " +
+                     "the surface doubles back on itself there, and the control's STL quality check rejects that");
+        }
 
         if (clearMesh > 0)
         {
@@ -1841,6 +1796,60 @@ static class Program
             }
         }
 
+        // ---- separate touching shells ----
+        // A fixture made of several stacked bodies exports with their mating
+        // faces exactly coincident. Decimation then leaves vertices micrometres
+        // off those planes and the shells genuinely interpenetrate - the
+        // control's STL quality check rejects that. A micro-shrink of every
+        // shell about its own centroid (tens of microns, invisible next to the
+        // 1.5mm clearance) turns face-on-face contact into a clean gap.
+        int shellsSeparated = 0;
+        if (shellGapMM > 0)
+        {
+            double gapU = (stlUnits == "in") ? shellGapMM / 25.4 : shellGapMM;
+            int nvv = mesh.Verts.Count;
+            int[] par = new int[nvv];
+            for (int i = 0; i < nvv; i++) par[i] = i;
+            for (int t = 0; t < mesh.Tris.Count; t += 3)
+            {
+                UnionV(par, mesh.Tris[t], mesh.Tris[t + 1]);
+                UnionV(par, mesh.Tris[t + 1], mesh.Tris[t + 2]);
+            }
+            Dictionary<int, int> rootIdx = new Dictionary<int, int>();
+            int[] comp = new int[nvv];
+            int nComp = 0;
+            for (int i = 0; i < nvv; i++)
+            {
+                int r = FindV(par, i);
+                int ci;
+                if (!rootIdx.TryGetValue(r, out ci)) { ci = nComp++; rootIdx[r] = ci; }
+                comp[i] = ci;
+            }
+            if (nComp > 1)
+            {
+                Vec3[] sum = new Vec3[nComp];
+                int[] cnt = new int[nComp];
+                for (int i = 0; i < nvv; i++) { sum[comp[i]] = sum[comp[i]] + mesh.Verts[i]; cnt[comp[i]]++; }
+                Vec3[] cen = new Vec3[nComp];
+                for (int c = 0; c < nComp; c++) cen[c] = sum[c] * (1.0 / Math.Max(1, cnt[c]));
+                double[] maxR = new double[nComp];
+                for (int i = 0; i < nvv; i++)
+                {
+                    double r = (mesh.Verts[i] - cen[comp[i]]).Length();
+                    if (r > maxR[comp[i]]) maxR[comp[i]] = r;
+                }
+                for (int i = 0; i < nvv; i++)
+                {
+                    double R = maxR[comp[i]];
+                    if (R <= gapU * 4) continue;   // a shell this tiny is a speck; leave it
+                    double f = 1.0 - gapU / R;
+                    Vec3 c = cen[comp[i]];
+                    mesh.Verts[i] = c + (mesh.Verts[i] - c) * f;
+                }
+                shellsSeparated = nComp;
+            }
+        }
+
         Prog.SetNow("writing " + mesh.TriangleCount + " triangles");
         try { if (ascii) StlIO.WriteAscii(output, mesh); else StlIO.WriteBinary(output, mesh); }
         catch (Exception ex) { Console.Error.WriteLine("WRITE FAILED: " + ex.Message); return 3; }
@@ -1861,6 +1870,8 @@ static class Program
             sb.Append(",\"weldCap\":").Append(F(weldCapMM));
             sb.Append(",\"holesFilled\":").Append(holesFilled);
             sb.Append(",\"fillTriangles\":").Append(fillTriangles);
+            sb.Append(",\"shellGap\":").Append(F(shellGapMM));
+            sb.Append(",\"shellsSeparated\":").Append(shellsSeparated);
             sb.Append(",\"topologyIn\":").Append(topoIn == null ? "null" : topoIn.Json());
             sb.Append(",\"topologyOut\":").Append(topoOut.Json());
             sb.Append(",\"cutBelowAttach\":").Append(didCut ? "true" : "false");
@@ -1945,6 +1956,9 @@ static class Program
 
     static string F(double v) { return v.ToString("0.######", CultureInfo.InvariantCulture); }
 
+    static int FindV(int[] p, int x) { while (p[x] != x) { p[x] = p[p[x]]; x = p[x]; } return x; }
+    static void UnionV(int[] p, int a, int b) { int ra = FindV(p, a), rb = FindV(p, b); if (ra != rb) p[rb] = ra; }
+
     static void Usage()
     {
         Console.Error.WriteLine("Usage: TNCWatcher-StlPrep.exe <input.stl> <output.stl> [options]");
@@ -1962,6 +1976,8 @@ static class Program
         Console.Error.WriteLine("  --weld-cap MM    absolute ceiling on the coarse weld tolerance, in mm");
         Console.Error.WriteLine("                   (default 0.35; 0 = only the diagonal-relative cap)");
         Console.Error.WriteLine("  --no-repair      do not fill holes left by processing or by the export");
+        Console.Error.WriteLine("  --shell-gap MM   micro-shrink each separate shell about its centroid so");
+        Console.Error.WriteLine("                   coincident mating faces become a clean gap (default 0.03; 0 = off)");
         Console.Error.WriteLine("  --progress-file F  write a one-line status to F while working");
         Console.Error.WriteLine("  --ascii          write ASCII STL instead of binary. Required for the TNC 640:");
         Console.Error.WriteLine("                   it rejects long runs of bytes with no line break on PUT.");

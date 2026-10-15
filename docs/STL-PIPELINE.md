@@ -15,8 +15,13 @@ STL (see E20001714 in CRITICAL-CONSTRAINTS.md).
 4. **Shell prune** — union-find components; drop specks (< 1% of diagonal)
    and sealed internal voids (bbox fully inside a larger shell).
 5. **Plane cut** (`--cut-below-attach`, FIXTURE only) — clip below z=0, cap
-   the openings (Sutherland-Hodgman + shared cut-point cache + ear-clip caps
-   facing −Z), compact orphan vertices.
+   the openings (Sutherland-Hodgman + shared cut-point cache), compact orphan
+   vertices. Caps are triangulated by `HoleFill.FillLoop`, which preserves the
+   loop's topological order — NEVER pick cap winding from the XY area sign:
+   that is correct for outer rims but inverts the cap over a hole tube
+   (vacuum port crossing the attach plane), folding the surface. The control
+   rejected a chuck fixture over exactly those folded edges
+   ("STL model does not fulfill the quality requirements", 2026-10-15).
 6. **Coarse pre-weld** — only when input > 8× budget (156k tris). Vertex
    clustering to thin the mesh before QEM. Tolerance starts at
    `targetEdge * coarse` and doubles per pass, capped by BOTH `diag*5e-3`
@@ -43,7 +48,14 @@ STL (see E20001714 in CRITICAL-CONSTRAINTS.md).
 10. **Clearance scale** (FIXTURE) — anchor at attach; per-axis factor from the
     **min** half-distance so every face moves at least `clearance` inward;
     z below attach clamped (mount features keep Z).
-11. **Write** — ASCII (control requirement) or binary; atomic tmp+move is the
+11. **Shell separation** (`--shell-gap`, default 0.03mm) — a multi-body
+    fixture exports with mating faces exactly coincident; decimation leaves
+    vertices micrometres off those planes and the shells interpenetrate.
+    Micro-shrink each connected shell about its own centroid so face-on-face
+    contact becomes a clean gap. Handles stacked bodies; does NOT fully solve
+    close-fitting nested bores (decimation chord-sag ~deviation can still
+    cross — union-remesh would be the escalation if the control objects).
+12. **Write** — ASCII (control requirement) or binary; atomic tmp+move is the
     watcher's job.
 
 ## Topology vocabulary
@@ -52,6 +64,14 @@ STL (see E20001714 in CRITICAL-CONSTRAINTS.md).
   This is what the control needs.
 - **Manifold** = zero edges with 3+ faces. Fusion exports routinely arrive
   closed but non-manifold (shell seams); the control has accepted these.
+- **Oriented** = every 2-face edge is traversed once in each direction.
+  A "misoriented/folded" edge (both faces wound the same way) means the
+  surface doubles back on itself; edge-USE counting cannot see it, and the
+  control's import quality check rejects it. `Topo.Check` counts these
+  (`misoriented` in the report; watcher logs `folded N`).
+- `service/stl-quality-gate.py` is the independent deep checker: all of the
+  above plus float32 degeneracy, duplicate triangles, facet-normal/winding
+  agreement, shell census, and grid-accelerated self-intersection search.
 
 ## Why the coarse weld is dangerous
 

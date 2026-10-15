@@ -31,6 +31,7 @@ service/*
 !service/stl-timing-test.ps1
 !service/stl-quality.py
 !service/stl-watertight.py
+!service/stl-quality-gate.py
 
 # Critical technical documentation
 !docs/

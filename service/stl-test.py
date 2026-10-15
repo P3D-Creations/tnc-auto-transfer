@@ -159,7 +159,7 @@ print("== TEST 8: pallet - pullstud BELOW attach plane must not move in Z ==")
 pal = box(-50,-50,0, 50,50,60) + box(-8,-8,-20, 8,8,0)
 ps = os.path.join(D, "pallet.stl"); pso = os.path.join(D, "pallet_out.stl")
 write_binary_stl(ps, pal)
-rc, so, se = run([ps, pso, "--clearance", "1.5", "--attach", "0,0,0"])
+rc, so, se = run([ps, pso, "--clearance", "1.5", "--attach", "0,0,0", "--shell-gap", "0"])
 check("exit 0", rc == 0, se)
 r = json.loads(so); bb = bbox(read_binary_stl(pso))
 print("   bbox out:", [round(x,4) for x in bb], " warnings:", r["warnings"])
@@ -203,7 +203,7 @@ print("== TEST 11: translate + clearance, mount features below attach hold Z =="
 # Same fixture plus a pullstud reaching below the attach plane.
 fx2 = fx + box(-80,-80,-186.71, -70,-70,-166.71)
 write_binary_stl(fp, fx2)
-rc, so, se = run([fp, fpo, "--attach", "%f,%f,%f" % A, "--clearance", "1.5", "--max-tris", "0"])
+rc, so, se = run([fp, fpo, "--attach", "%f,%f,%f" % A, "--clearance", "1.5", "--max-tris", "0", "--shell-gap", "0"])
 check("exit 0", rc == 0, se)
 r = json.loads(so); bb = bbox(read_binary_stl(fpo))
 print("   bbox out:", [round(x,4) for x in bb], " scale:", r["scale"])
@@ -234,7 +234,7 @@ check("no file written", not os.path.exists(probe_out), "file appeared")
 check("bounds as-read (un-translated)", abs(r["bboxIn"][0] - (-80)) < 1e-3, str(r["bboxIn"]))
 
 print("== TEST 14: --no-translate keeps mesh in place ==")
-rc, so, se = run([fp, fpo, "--attach", "%f,%f,%f" % A, "--no-translate", "--max-tris", "0"])
+rc, so, se = run([fp, fpo, "--attach", "%f,%f,%f" % A, "--no-translate", "--max-tris", "0", "--shell-gap", "0"])
 r = json.loads(so); bb = bbox(read_binary_stl(fpo))
 check("exit 0", rc == 0, se)
 check("not translated", r["translated"] is False, so)
@@ -292,6 +292,70 @@ r = json.loads(so)
 check("nothing filled", r["holesFilled"] == 0, so)
 check("output still open", r["topologyOut"]["closed"] is False, so)
 check("warns not closed", any("NOT closed" in w for w in r["warnings"]), so)
+
+def quad(ts, a, b, c, d):   # CCW viewed from outside
+    ts.append((a, b, c)); ts.append((a, c, d))
+
+def tube_box(O=20.0, I=5.0, zb=-10.0, zt=10.0):
+    # closed box with a square channel through it in Z: grid-aligned, no
+    # T-junctions (rings split at the channel lines, walls split to match)
+    ts = []
+    xs = [-O, -I, I, O]; ys = [-O, -I, I, O]
+    for i in range(3):
+        for j in range(3):
+            if i == 1 and j == 1: continue
+            x0, x1, y0, y1 = xs[i], xs[i+1], ys[j], ys[j+1]
+            quad(ts, (x0,y0,zt), (x1,y0,zt), (x1,y1,zt), (x0,y1,zt))   # top +Z
+            quad(ts, (x0,y0,zb), (x0,y1,zb), (x1,y1,zb), (x1,y0,zb))   # bottom -Z
+    for (x0, x1) in ((-O,-I), (-I,I), (I,O)):
+        quad(ts, (x0,-O,zb), (x1,-O,zb), (x1,-O,zt), (x0,-O,zt))       # south -Y
+        quad(ts, (x1, O,zb), (x0, O,zb), (x0, O,zt), (x1, O,zt))       # north +Y
+    for (y0, y1) in ((-O,-I), (-I,I), (I,O)):
+        quad(ts, (-O,y1,zb), (-O,y0,zb), (-O,y0,zt), (-O,y1,zt))       # west -X
+        quad(ts, ( O,y0,zb), ( O,y1,zb), ( O,y1,zt), ( O,y0,zt))       # east +X
+    # channel walls: outward normal points INTO the channel void
+    quad(ts, (-I,-I,zb), (-I, I,zb), (-I, I,zt), (-I,-I,zt))           # +X
+    quad(ts, ( I, I,zb), ( I,-I,zb), ( I,-I,zt), ( I, I,zt))           # -X
+    quad(ts, ( I,-I,zb), (-I,-I,zb), (-I,-I,zt), ( I,-I,zt))           # +Y
+    quad(ts, (-I, I,zb), ( I, I,zb), ( I, I,zt), (-I, I,zt))           # -Y
+    return ts
+
+print("== TEST 20: cut cap over a through-hole is wound with the hole, not against it ==")
+st20 = os.path.join(D, "tube20.stl"); st20o = os.path.join(D, "tube20_out.stl")
+write_binary_stl(st20, tube_box())
+rc, so, se = run([st20, st20o, "--attach", "0,0,0", "--cut-below-attach", "--max-tris", "0"])
+check("exit 0", rc == 0, se)
+r = json.loads(so)
+check("input valid", r["topologyIn"]["closed"] is True and r["topologyIn"]["misoriented"] == 0, so)
+check("two cap loops (outer rim + channel rim)", r["capLoops"] == 2, so)
+check("output closed", r["topologyOut"]["closed"] is True, so)
+check("NO folded edges (hole cap winding)", r["topologyOut"]["misoriented"] == 0, so)
+bb = bbox(read_binary_stl(st20o))
+check("nothing below plane", abs(bb[2]) < 1e-6, str(bb))
+
+print("== TEST 21: touching shells get micro-separated so mating faces cannot interpenetrate ==")
+st21 = os.path.join(D, "stack21.stl"); st21o = os.path.join(D, "stack21_out.stl")
+write_binary_stl(st21, box(-10,-10,0, 10,10,10) + box(-8,-8,10, 8,8,20))
+rc, so, se = run([st21, st21o, "--max-tris", "0"])
+check("exit 0", rc == 0, se)
+r = json.loads(so)
+check("two shells separated", r["shellsSeparated"] == 2, so)
+zs = sorted(set(p[2] for t in read_binary_stl(st21o) for p in t))
+at10   = [z for z in zs if abs(z - 10.0) < 1e-7]
+below  = [z for z in zs if 9.9 < z < 10.0 - 1e-7]
+above  = [z for z in zs if 10.0 + 1e-7 < z < 10.1]
+check("no vertex left exactly on the interface", len(at10) == 0, str(zs))
+check("gap opened across the interface", len(below) > 0 and len(above) > 0 and min(above) > max(below), str(zs))
+check("still closed", r["topologyOut"]["closed"] is True, so)
+
+print("== TEST 22: single body is NOT shrunk by the shell gap ==")
+st22o = os.path.join(D, "single22_out.stl")
+write_binary_stl(st21, box(-10,-10,0, 10,10,10))
+rc, so, se = run([st21, st22o, "--max-tris", "0"])
+check("exit 0", rc == 0, se)
+r = json.loads(so)
+check("one shell untouched", r["shellsSeparated"] == 0, so)
+check("bbox exact", bbox(read_binary_stl(st22o)) == (-10.0,-10.0,0.0,10.0,10.0,10.0), so)
 
 print()
 print("FAILURES: " + (", ".join(fails) if fails else "none"))
